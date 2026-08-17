@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
@@ -27,13 +27,18 @@ jobs:
         with:
           toolchain: ${{ matrix.toolchain }}
       - name: Check
+        id: check_step
+        run: cargo check --all-targets
+      - name: Capture error log
+        if: failure() && matrix.toolchain == 'stable'
         run: |
-          if ! output=$(cargo check --all-targets 2>&1); then
-            echo "$output" | head -n 30 | while IFS= read -r line; do
-              echo "::error::$line"
-            done
-            exit 1
-          fi
+          cargo check --all-targets 2>&1 > compiler_error.txt || true
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -B ai/build-diagnostics
+          git add compiler_error.txt
+          git commit -m "diagnostics: compiler error log [skip ci]"
+          git push -f origin ai/build-diagnostics
       - name: Test
         run: cargo test --all-targets
 
