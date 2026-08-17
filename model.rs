@@ -43,18 +43,73 @@ impl LmConfig {
         }
     }
 
+    pub fn check(&self) -> Result<(), String> {
+        if self.vocab == 0 {
+            return Err("vocabulary size must be positive".to_string());
+        }
+        if self.vocab > u32::MAX as usize {
+            return Err("vocabulary exceeds the u32 token-id space".to_string());
+        }
+        if self.d_model == 0 {
+            return Err("d_model must be positive".to_string());
+        }
+        if self.n_layer == 0 {
+            return Err("n_layer must be positive".to_string());
+        }
+        if self.expand == 0 {
+            return Err("expand must be positive".to_string());
+        }
+        if self.conv_k == 0 {
+            return Err("conv_k must be positive".to_string());
+        }
+        if self.mlp_mult == 0 {
+            return Err("mlp_mult must be positive".to_string());
+        }
+        if !self.eps.is_finite() || self.eps <= 0.0 {
+            return Err("RMSNorm epsilon must be finite and positive".to_string());
+        }
+        if !self.tau_max.is_finite() || self.tau_max < 1.0 {
+            return Err("tau_max must be finite and at least one".to_string());
+        }
+        let inner = self
+            .d_model
+            .checked_mul(self.expand)
+            .ok_or_else(|| "model inner width overflow".to_string())?;
+        let hidden = self
+            .d_model
+            .checked_mul(self.mlp_mult)
+            .ok_or_else(|| "model hidden width overflow".to_string())?;
+        let recurrent_projection = inner
+            .checked_mul(3)
+            .ok_or_else(|| "recurrent projection width overflow".to_string())?;
+        let mlp_projection = hidden
+            .checked_mul(2)
+            .ok_or_else(|| "MLP projection width overflow".to_string())?;
+        self.vocab
+            .checked_mul(self.d_model)
+            .ok_or_else(|| "embedding table is too large".to_string())?;
+        recurrent_projection
+            .checked_mul(self.d_model)
+            .ok_or_else(|| "recurrent input projection is too large".to_string())?;
+        self.conv_k
+            .checked_mul(inner)
+            .ok_or_else(|| "convolution parameter size overflow".to_string())?;
+        self.d_model
+            .checked_mul(inner)
+            .ok_or_else(|| "recurrent output projection is too large".to_string())?;
+        mlp_projection
+            .checked_mul(self.d_model)
+            .ok_or_else(|| "MLP input projection is too large".to_string())?;
+        self.d_model
+            .checked_mul(hidden)
+            .ok_or_else(|| "MLP output projection is too large".to_string())?;
+        Ok(())
+    }
+
     pub fn validate(&self) {
-        assert!(self.vocab > 0, "vocabulary size must be positive");
-        assert!(self.d_model > 0, "d_model must be positive");
-        assert!(self.n_layer > 0, "n_layer must be positive");
-        assert!(self.expand > 0, "expand must be positive");
-        assert!(self.conv_k > 0, "conv_k must be positive");
-        assert!(self.mlp_mult > 0, "mlp_mult must be positive");
-        assert!(self.eps.is_finite() && self.eps > 0.0, "RMSNorm epsilon must be finite and positive");
-        assert!(self.tau_max.is_finite() && self.tau_max > 0.0, "tau_max must be finite and positive");
-        let _ = self.inner();
-        let _ = self.hidden();
-        let _ = self.vocab.checked_mul(self.d_model).expect("embedding table is too large");
+        if let Err(message) = self.check() {
+            panic!("{}", message);
+        }
     }
 
     pub fn inner(&self) -> usize {
@@ -63,6 +118,14 @@ impl LmConfig {
 
     pub fn hidden(&self) -> usize {
         self.d_model.checked_mul(self.mlp_mult).expect("model hidden width overflow")
+    }
+
+    pub fn recurrent_projection(&self) -> usize {
+        self.inner().checked_mul(3).expect("recurrent projection width overflow")
+    }
+
+    pub fn mlp_projection(&self) -> usize {
+        self.hidden().checked_mul(2).expect("MLP projection width overflow")
     }
 }
 
@@ -78,7 +141,8 @@ pub struct SsmLayer {
 impl SsmLayer {
     pub fn new(g: &mut Graph, rng: &mut Rng, name: &str, cfg: &LmConfig, depth_scale: f32) -> SsmLayer {
         let e = cfg.inner();
-        let in_proj = Linear::new(g, rng, &format!("{}.in_proj", name), cfg.d_model, 3 * e, true, init_std(cfg.d_model));
+        let projection = cfg.recurrent_projection();
+        let in_proj = Linear::new(g, rng, &format!("{}.in_proj", name), cfg.d_model, projection, true, init_std(cfg.d_model));
 
         // a = exp(-1/tau) => z = logit(a), with tau log-spaced over
         // [1, tau_max]. This gives useful short and long memory at step zero.
@@ -86,7 +150,7 @@ impl SsmLayer {
             Some(id) => id,
             None => panic!("in_proj must have a bias"),
         };
-        let tau_max = cfg.tau_max.max(2.0);
+        let tau_max = cfg.tau_max;
         for j in 0..e {
             let fraction = if e > 1 { (j as f32) / ((e - 1) as f32) } else { 0.0 };
             let tau = tau_max.powf(fraction);
@@ -124,9 +188,10 @@ impl SsmLayer {
         let rows = batch.checked_mul(t).expect("sequence row count overflow");
         let e = self.e;
         let u = self.in_proj.forward(g, x, rows);
-        let v = g.slice_cols(u, rows, 3 * e, 0, e);
-        let z = g.slice_cols(u, rows, 3 * e, e, e);
-        let o = g.slice_cols(u, rows, 3 * e, 2 * e, e);
+        let projection = e.checked_mul(3).expect("recurrent projection width overflow");
+        let v = g.slice_cols(u, rows, projection, 0, e);
+        let z = g.slice_cols(u, rows, projection, e, e);
+        let o = g.slice_cols(u, rows, projection, 2 * e, e);
         let convolved = g.dwconv(v, self.conv_w, self.conv_b, batch, t, e, self.k);
         let value = g.silu(convolved);
         let decay = g.sigmoid(z);

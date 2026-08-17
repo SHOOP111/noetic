@@ -7,7 +7,9 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
+  pull-requests: write
+  issues: write
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
@@ -27,9 +29,49 @@ jobs:
         with:
           toolchain: ${{ matrix.toolchain }}
       - name: Check
-        run: cargo check --all-targets
+        run: cargo check --all-targets 2>&1 | tee /tmp/cargo_check.log
+      - name: Post check failure log
+        if: failure() && matrix.toolchain == 'stable'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            let log = '';
+            try {
+              log = fs.readFileSync('/tmp/cargo_check.log', 'utf8');
+            } catch (e) {
+              log = String(e);
+            }
+            if (context.issue.number) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body: '### Cargo Check Failure (' + '${{ matrix.toolchain }}' + '):\n```\n' + log.slice(-60000) + '\n```'
+              });
+            }
       - name: Test
-        run: cargo test --all-targets
+        run: cargo test --all-targets 2>&1 | tee /tmp/cargo_test.log
+      - name: Post test failure log
+        if: failure() && matrix.toolchain == 'stable'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            let log = '';
+            try {
+              log = fs.readFileSync('/tmp/cargo_test.log', 'utf8');
+            } catch (e) {
+              log = String(e);
+            }
+            if (context.issue.number) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body: '### Cargo Test Failure (' + '${{ matrix.toolchain }}' + '):\n```\n' + log.slice(-60000) + '\n```'
+              });
+            }
 
   selftest:
     name: Engine self-test
@@ -37,7 +79,28 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - run: cargo run --release -- selftest --threads 2
+      - name: Run selftest
+        run: cargo run --release -- selftest --threads 2 2>&1 | tee /tmp/selftest.log
+      - name: Post selftest failure log
+        if: failure()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            let log = '';
+            try {
+              log = fs.readFileSync('/tmp/selftest.log', 'utf8');
+            } catch (e) {
+              log = String(e);
+            }
+            if (context.issue.number) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body: '### Selftest Failure:\n```\n' + log.slice(-60000) + '\n```'
+              });
+            }
 
   verify:
     name: Independent verifiers

@@ -8,7 +8,15 @@
 //!   training-time segmentation.
 
 use std::collections::{HashMap, HashSet};
-use std::io::Write;
+use std::fs::{File, OpenOptions};
+use std::io::{BufWriter, Write};
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+const MAX_TOKENIZER_FILE_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_SERIALIZED_MERGES: usize = 1_000_000;
+const MAX_EXPANDED_TOKEN_BYTES: usize = 1024 * 1024;
+const MAX_TOTAL_EXPANDED_BYTES: usize = 128 * 1024 * 1024;
+static TEMP_FILE_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
 pub struct Bpe {
     /// Merge i creates token (256 + i) from a pair of existing tokens.
@@ -20,6 +28,22 @@ pub struct Bpe {
 
 fn invalid_data(message: &str) -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::InvalidData, message.to_string())
+}
+
+fn create_temp_file(path: &str) -> std::io::Result<(String, File)> {
+    for _ in 0..128 {
+        let nonce = TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let candidate = format!("{}.tmp.{}.{}", path, std::process::id(), nonce);
+        match OpenOptions::new().write(true).create_new(true).open(&candidate) {
+            Ok(file) => return Ok((candidate, file)),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        "could not allocate a unique tokenizer temporary file",
+    ))
 }
 
 impl Bpe {
@@ -42,8 +66,12 @@ impl Bpe {
         let rank = self.merges.len() as u32;
         self.merges.push((a, b));
         self.rank.insert((a, b), rank);
-        let mut bytes = self.token_bytes[a as usize].clone();
-        bytes.extend_from_slice(&self.token_bytes[b as usize]);
+        let left = &self.token_bytes[a as usize];
+        let right = &self.token_bytes[b as usize];
+        let length = left.len().checked_add(right.len()).expect("BPE token expansion overflow");
+        let mut bytes = Vec::with_capacity(length);
+        bytes.extend_from_slice(left);
+        bytes.extend_from_slice(right);
         self.token_bytes.push(bytes);
     }
 
@@ -249,7 +277,11 @@ impl Bpe {
     /// Decode exactly, returning `None` rather than silently dropping an
     /// out-of-range token id.
     pub fn decode_bytes(&self, ids: &[u32]) -> Option<Vec<u8>> {
-        let mut bytes = Vec::with_capacity(ids.len().saturating_mul(2));
+        let total_bytes = ids.iter().try_fold(0usize, |total, &id| {
+            let token = self.token_bytes.get(id as usize)?;
+            total.checked_add(token.len())
+        })?;
+        let mut bytes = Vec::with_capacity(total_bytes);
         for &id in ids {
             let token = self.token_bytes.get(id as usize)?;
             bytes.extend_from_slice(token);
@@ -265,15 +297,17 @@ impl Bpe {
     }
 
     pub fn save(&self, path: &str) -> std::io::Result<()> {
-        let tmp_path = format!("{}.tmp.{}", path, std::process::id());
+        let (tmp_path, file) = create_temp_file(path)?;
         let write_result = (|| -> std::io::Result<()> {
-            let mut file = std::fs::File::create(&tmp_path)?;
-            writeln!(file, "noetic-bpe 1")?;
-            writeln!(file, "{}", self.merges.len())?;
+            let mut writer = BufWriter::new(file);
+            writeln!(writer, "noetic-bpe 1")?;
+            writeln!(writer, "{}", self.merges.len())?;
             for &(a, b) in &self.merges {
-                writeln!(file, "{} {}", a, b)?;
+                writeln!(writer, "{} {}", a, b)?;
             }
-            file.sync_all()?;
+            writer.flush()?;
+            writer.get_ref().sync_all()?;
+            drop(writer);
             std::fs::rename(&tmp_path, path)?;
             Ok(())
         })();
@@ -284,7 +318,14 @@ impl Bpe {
     }
 
     pub fn load(path: &str) -> std::io::Result<Bpe> {
+        let file_size = std::fs::metadata(path)?.len();
+        if file_size > MAX_TOKENIZER_FILE_BYTES {
+            return Err(invalid_data("tokenizer file exceeds the supported size limit"));
+        }
         let text = std::fs::read_to_string(path)?;
+        if text.len() as u64 > MAX_TOKENIZER_FILE_BYTES {
+            return Err(invalid_data("tokenizer file changed while it was being read"));
+        }
         let mut lines = text.lines();
         if lines.next() != Some("noetic-bpe 1") {
             return Err(invalid_data("unsupported tokenizer header or version"));
@@ -294,11 +335,12 @@ impl Bpe {
             .ok_or_else(|| invalid_data("tokenizer merge count is missing"))?
             .parse()
             .map_err(|_| invalid_data("tokenizer merge count is invalid"))?;
-        if merge_count > (u32::MAX as usize).saturating_sub(256) {
+        if merge_count > MAX_SERIALIZED_MERGES || merge_count > (u32::MAX as usize).saturating_sub(256) {
             return Err(invalid_data("tokenizer declares too many merges"));
         }
 
         let mut bpe = Bpe::bytes_only();
+        let mut total_expanded_bytes = 256usize;
         for _ in 0..merge_count {
             let line = lines.next().ok_or_else(|| invalid_data("tokenizer merge list is truncated"))?;
             let mut fields = line.split_whitespace();
@@ -322,11 +364,47 @@ impl Bpe {
             if bpe.rank.contains_key(&(a, b)) {
                 return Err(invalid_data("tokenizer contains a duplicate merge pair"));
             }
+            let expanded_bytes = bpe.token_bytes[a as usize]
+                .len()
+                .checked_add(bpe.token_bytes[b as usize].len())
+                .ok_or_else(|| invalid_data("tokenizer token expansion overflows"))?;
+            if expanded_bytes > MAX_EXPANDED_TOKEN_BYTES {
+                return Err(invalid_data("tokenizer contains an excessively large expanded token"));
+            }
+            total_expanded_bytes = total_expanded_bytes
+                .checked_add(expanded_bytes)
+                .ok_or_else(|| invalid_data("tokenizer expansion size overflows"))?;
+            if total_expanded_bytes > MAX_TOTAL_EXPANDED_BYTES {
+                return Err(invalid_data("tokenizer expanded vocabulary exceeds the supported size limit"));
+            }
             bpe.push_merge(a, b);
         }
         if lines.any(|line| !line.trim().is_empty()) {
             return Err(invalid_data("tokenizer has trailing data"));
         }
         Ok(bpe)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn loader_rejects_exponential_token_expansion() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("noetic-bpe-bomb-{}-{}.tok", std::process::id(), unique));
+        let mut serialized = String::from("noetic-bpe 1\n22\n");
+        for merge in 0..22u32 {
+            let source = if merge == 0 { 97 } else { 255 + merge };
+            serialized.push_str(&format!("{} {}\n", source, source));
+        }
+        std::fs::write(&path, serialized).unwrap();
+        let result = Bpe::load(path.to_str().unwrap());
+        let _ = std::fs::remove_file(&path);
+        assert!(result.is_err());
     }
 }

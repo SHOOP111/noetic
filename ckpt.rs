@@ -17,12 +17,16 @@
 
 use crate::autograd::Graph;
 use std::collections::{HashMap, HashSet};
+use std::fs::{File, OpenOptions};
 use std::io::Write;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 const MAGIC: &[u8; 8] = b"NOETIC\x00\x01";
 const VERSION: u32 = 1;
 const MAX_RANK: usize = 32;
 const MAX_ENTRIES: usize = 1_000_000;
+const MAX_CHECKPOINT_FILE_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+static TEMP_FILE_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
 pub fn crc32(data: &[u8]) -> u32 {
     let mut table = [0u32; 256];
@@ -49,6 +53,52 @@ fn bad(msg: &str) -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::InvalidData, msg.to_string())
 }
 
+fn create_temp_file(path: &str) -> std::io::Result<(String, File)> {
+    for _ in 0..128 {
+        let nonce = TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let candidate = format!("{}.tmp.{}.{}", path, std::process::id(), nonce);
+        match OpenOptions::new().write(true).create_new(true).open(&candidate) {
+            Ok(file) => return Ok((candidate, file)),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        "could not allocate a unique checkpoint temporary file",
+    ))
+}
+
+fn serialized_size(g: &Graph, meta: &[(String, String)]) -> std::io::Result<usize> {
+    let mut bytes = (MAGIC.len() + 4 + 4 + 4 + 4) as u64;
+    for (key, value) in meta {
+        bytes = bytes
+            .checked_add(8)
+            .and_then(|size| size.checked_add(key.len() as u64))
+            .and_then(|size| size.checked_add(value.len() as u64))
+            .ok_or_else(|| bad("checkpoint serialized size overflows"))?;
+    }
+    for parameter in &g.params {
+        let id = parameter.id;
+        let shape_bytes = (g.shape[id].len() as u64)
+            .checked_mul(4)
+            .ok_or_else(|| bad("checkpoint shape size overflows"))?;
+        let value_bytes = (g.val[id].len() as u64)
+            .checked_mul(4)
+            .ok_or_else(|| bad("checkpoint tensor size overflows"))?;
+        bytes = bytes
+            .checked_add(12)
+            .and_then(|size| size.checked_add(parameter.name.len() as u64))
+            .and_then(|size| size.checked_add(shape_bytes))
+            .and_then(|size| size.checked_add(value_bytes))
+            .ok_or_else(|| bad("checkpoint serialized size overflows"))?;
+    }
+    if bytes > MAX_CHECKPOINT_FILE_BYTES || bytes > usize::MAX as u64 {
+        return Err(bad("checkpoint exceeds the supported size limit"));
+    }
+    Ok(bytes as usize)
+}
+
 fn checked_u32(value: usize, what: &str) -> std::io::Result<u32> {
     u32::try_from(value).map_err(|_| bad(&format!("{} exceeds the checkpoint format limit", what)))
 }
@@ -64,7 +114,10 @@ fn put_str(buf: &mut Vec<u8>, value: &str, what: &str) -> std::io::Result<()> {
 }
 
 pub fn save(path: &str, g: &Graph, meta: &[(String, String)]) -> std::io::Result<()> {
-    let mut buf: Vec<u8> = Vec::new();
+    if meta.len() > MAX_ENTRIES || g.params.len() > MAX_ENTRIES {
+        return Err(bad("checkpoint contains too many entries"));
+    }
+    let mut buf: Vec<u8> = Vec::with_capacity(serialized_size(g, meta)?);
     buf.extend_from_slice(MAGIC);
     put_u32(&mut buf, VERSION);
     put_u32(&mut buf, checked_u32(meta.len(), "metadata count")?);
@@ -107,6 +160,9 @@ pub fn save(path: &str, g: &Graph, meta: &[(String, String)]) -> std::io::Result
         }
         put_u32(&mut buf, checked_u32(values.len(), "tensor element count")?);
         for &value in values {
+            if !value.is_finite() {
+                return Err(bad("checkpoint tensors must contain only finite values"));
+            }
             buf.extend_from_slice(&value.to_le_bytes());
         }
     }
@@ -116,9 +172,8 @@ pub fn save(path: &str, g: &Graph, meta: &[(String, String)]) -> std::io::Result
 
     // Write-then-rename prevents an interrupted save from replacing the last
     // valid checkpoint with a partial file.
-    let tmp_path = format!("{}.tmp.{}", path, std::process::id());
+    let (tmp_path, mut file) = create_temp_file(path)?;
     let write_result = (|| -> std::io::Result<()> {
-        let mut file = std::fs::File::create(&tmp_path)?;
         file.write_all(&buf)?;
         file.sync_all()?;
         std::fs::rename(&tmp_path, path)?;
@@ -137,6 +192,37 @@ pub struct Ckpt {
 }
 
 impl Ckpt {
+    pub fn require_usize(&self, key: &str) -> std::io::Result<usize> {
+        let value = self
+            .meta
+            .get(key)
+            .ok_or_else(|| bad(&format!("checkpoint metadata is missing '{}'", key)))?;
+        value
+            .parse::<usize>()
+            .map_err(|_| bad(&format!("checkpoint metadata '{}' is not a valid integer", key)))
+    }
+
+    pub fn require_f32(&self, key: &str) -> std::io::Result<f32> {
+        let value = self
+            .meta
+            .get(key)
+            .ok_or_else(|| bad(&format!("checkpoint metadata is missing '{}'", key)))?;
+        let parsed = value
+            .parse::<f32>()
+            .map_err(|_| bad(&format!("checkpoint metadata '{}' is not a valid number", key)))?;
+        if !parsed.is_finite() {
+            return Err(bad(&format!("checkpoint metadata '{}' must be finite", key)));
+        }
+        Ok(parsed)
+    }
+
+    pub fn optional_f32(&self, key: &str, default: f32) -> std::io::Result<f32> {
+        match self.meta.get(key) {
+            Some(_) => self.require_f32(key),
+            None => Ok(default),
+        }
+    }
+
     pub fn meta_usize(&self, key: &str, default: usize) -> usize {
         match self.meta.get(key) {
             Some(value) => value.parse::<usize>().unwrap_or(default),
@@ -191,7 +277,14 @@ impl<'a> Cur<'a> {
 }
 
 pub fn load(path: &str) -> std::io::Result<Ckpt> {
+    let file_size = std::fs::metadata(path)?.len();
+    if file_size > MAX_CHECKPOINT_FILE_BYTES {
+        return Err(bad("checkpoint file exceeds the supported size limit"));
+    }
     let raw = std::fs::read(path)?;
+    if raw.len() as u64 > MAX_CHECKPOINT_FILE_BYTES {
+        return Err(bad("checkpoint file changed while it was being read"));
+    }
     if raw.len() < 24 {
         return Err(bad("checkpoint too small"));
     }
@@ -258,7 +351,11 @@ pub fn load(path: &str) -> std::io::Result<Ckpt> {
         }
         let mut values = Vec::with_capacity(numel);
         for _ in 0..numel {
-            values.push(cursor.f32()?);
+            let value = cursor.f32()?;
+            if !value.is_finite() {
+                return Err(bad("checkpoint tensor contains a non-finite value"));
+            }
+            values.push(value);
         }
         shapes.insert(name.clone(), shape);
         tensors.insert(name, values);
@@ -288,4 +385,60 @@ pub fn apply(g: &mut Graph, ckpt: &Ckpt) -> (usize, usize, usize) {
         }
     }
     (loaded, missing, mismatch)
+}
+
+/// Validate a complete checkpoint against a live graph and apply it
+/// transactionally. No parameter is changed unless every expected tensor is
+/// present with the exact shape and there are no unexpected tensors.
+pub fn apply_exact(g: &mut Graph, ckpt: &Ckpt) -> std::io::Result<usize> {
+    if ckpt.tensors.len() != g.params.len() || ckpt.shapes.len() != g.params.len() {
+        return Err(bad("checkpoint tensor set does not exactly match the model"));
+    }
+    for parameter in &g.params {
+        let id = parameter.id;
+        let values = ckpt
+            .tensors
+            .get(&parameter.name)
+            .ok_or_else(|| bad(&format!("checkpoint is missing tensor '{}'", parameter.name)))?;
+        let shape = ckpt
+            .shapes
+            .get(&parameter.name)
+            .ok_or_else(|| bad(&format!("checkpoint is missing shape for '{}'", parameter.name)))?;
+        if shape != &g.shape[id] || values.len() != g.val[id].len() {
+            return Err(bad(&format!("checkpoint tensor '{}' has the wrong shape", parameter.name)));
+        }
+        if values.iter().any(|value| !value.is_finite()) {
+            return Err(bad(&format!("checkpoint tensor '{}' contains a non-finite value", parameter.name)));
+        }
+    }
+    for parameter in &g.params {
+        let id = parameter.id;
+        g.val[id].copy_from_slice(&ckpt.tensors[&parameter.name]);
+    }
+    Ok(g.params.len())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn exact_apply_is_transactional() {
+        let mut graph = Graph::new(1);
+        let first = graph.param("first", vec![2], vec![1.0, 2.0], true);
+        let second = graph.param("second", vec![1], vec![3.0], true);
+        graph.seal_params();
+
+        let mut tensors = HashMap::new();
+        tensors.insert("first".to_string(), vec![10.0, 20.0]);
+        tensors.insert("second".to_string(), vec![30.0]);
+        let mut shapes = HashMap::new();
+        shapes.insert("first".to_string(), vec![2]);
+        shapes.insert("second".to_string(), vec![2]);
+        let checkpoint = Ckpt { meta: HashMap::new(), tensors, shapes };
+
+        assert!(apply_exact(&mut graph, &checkpoint).is_err());
+        assert_eq!(graph.val[first], vec![1.0, 2.0]);
+        assert_eq!(graph.val[second], vec![3.0]);
+    }
 }

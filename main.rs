@@ -38,7 +38,7 @@ mod tensor;
 use crate::autograd::Graph;
 use crate::bpe::Bpe;
 use crate::data::Batcher;
-use crate::infer::{sample_token, LmState, SampleCfg};
+use crate::infer::{sample_token, Decoder, SampleCfg};
 use crate::model::{Lm, LmConfig};
 use crate::optim::{AdamW, Schedule};
 use crate::plan::{action_name, Puzzle, PvNet, N_ACT};
@@ -56,6 +56,11 @@ struct Args {
     cmd: String,
     map: HashMap<String, String>,
     pos: Vec<String>,
+}
+
+fn invalid_argument(flag: &str, value: &str, expected: &str) -> ! {
+    eprintln!("invalid value for --{}: {:?} (expected {})", flag, value, expected);
+    std::process::exit(2);
 }
 
 impl Args {
@@ -107,7 +112,7 @@ impl Args {
         match self.map.get(k) {
             Some(v) => match v.parse::<usize>() {
                 Ok(x) => x,
-                Err(_) => d,
+                Err(_) => invalid_argument(k, v, "a non-negative integer"),
             },
             None => d,
         }
@@ -115,8 +120,9 @@ impl Args {
     fn get_f32(&self, k: &str, d: f32) -> f32 {
         match self.map.get(k) {
             Some(v) => match v.parse::<f32>() {
-                Ok(x) => x,
-                Err(_) => d,
+                Ok(x) if x.is_finite() => x,
+                Err(_) => invalid_argument(k, v, "a finite number"),
+                Ok(_) => invalid_argument(k, v, "a finite number"),
             },
             None => d,
         }
@@ -125,7 +131,11 @@ impl Args {
         match self.map.get(k) {
             Some(v) => {
                 let s = v.to_lowercase();
-                !(s == "false" || s == "0" || s == "no")
+                match s.as_str() {
+                    "true" | "1" | "yes" => true,
+                    "false" | "0" | "no" => false,
+                    _ => invalid_argument(k, v, "true/false, yes/no, or 1/0"),
+                }
             }
             None => d,
         }
@@ -133,7 +143,32 @@ impl Args {
 }
 
 fn threads_of(a: &Args) -> usize {
-    a.get_usize("threads", tensor::n_threads_default())
+    let threads = a.get_usize("threads", tensor::n_threads_default());
+    if threads == 0 {
+        invalid_argument("threads", "0", "an integer greater than zero");
+    }
+    threads
+}
+
+fn require_positive(flag: &str, value: usize) -> usize {
+    if value == 0 {
+        invalid_argument(flag, "0", "an integer greater than zero");
+    }
+    value
+}
+
+fn require_nonnegative_finite(flag: &str, value: f32) -> f32 {
+    if !value.is_finite() || value < 0.0 {
+        invalid_argument(flag, &format!("{}", value), "a finite number greater than or equal to zero");
+    }
+    value
+}
+
+fn require_positive_finite(flag: &str, value: f32) -> f32 {
+    if !value.is_finite() || value <= 0.0 {
+        invalid_argument(flag, &format!("{}", value), "a finite number greater than zero");
+    }
+    value
 }
 
 fn fmt_int(n: usize) -> String {
@@ -195,15 +230,16 @@ fn cmd_bench(a: &Args) {
     println!();
 
     // ---- GEMM ----
-    let n = a.get_usize("n", 256);
-    let mut x = vec![0.0f32; n * n];
-    let mut y = vec![0.0f32; n * n];
+    let n = require_positive("n", a.get_usize("n", 256));
+    let matrix_elements = n.checked_mul(n).unwrap_or_else(|| invalid_argument("n", &format!("{}", n), "a matrix width whose square fits in memory"));
+    let mut x = vec![0.0f32; matrix_elements];
+    let mut y = vec![0.0f32; matrix_elements];
     for i in 0..x.len() {
         x[i] = rng.normal();
         y[i] = rng.normal();
     }
-    let mut z = vec![0.0f32; n * n];
-    let reps = a.get_usize("reps", 8);
+    let mut z = vec![0.0f32; matrix_elements];
+    let reps = require_positive("reps", a.get_usize("reps", 8));
     let t0 = Instant::now();
     for _ in 0..reps {
         tensor::gemm_nn(&x, &y, &mut z, n, n, n, threads);
@@ -257,27 +293,34 @@ fn cmd_bench(a: &Args) {
     let vocab = 512usize;
     let cfg = LmConfig {
         vocab,
-        d_model: a.get_usize("d", 128),
-        n_layer: a.get_usize("layers", 2),
-        expand: a.get_usize("expand", 2),
+        d_model: require_positive("d", a.get_usize("d", 128)),
+        n_layer: require_positive("layers", a.get_usize("layers", 2)),
+        expand: require_positive("expand", a.get_usize("expand", 2)),
         conv_k: 4,
         mlp_mult: 3,
         eps: 1e-5,
         tau_max: 128.0,
     };
-    let batch = a.get_usize("batch", 8);
-    let ctx = a.get_usize("ctx", 64);
+    if let Err(message) = cfg.check() {
+        eprintln!("invalid benchmark model configuration: {}", message);
+        return;
+    }
+    let batch = require_positive("batch", a.get_usize("batch", 8));
+    let ctx = require_positive("ctx", a.get_usize("ctx", 64));
     let mut g = Graph::new(threads);
     let m = Lm::new(&mut g, &mut rng, cfg);
     g.seal_params();
     let mut opt = AdamW::new(&g, 0.01);
-    let mut ids = vec![0u32; batch * ctx];
-    let mut tgt = vec![0u32; batch * ctx];
+    let train_elements = batch
+        .checked_mul(ctx)
+        .unwrap_or_else(|| invalid_argument("batch/ctx", "overflow", "dimensions whose product fits in memory"));
+    let mut ids = vec![0u32; train_elements];
+    let mut tgt = vec![0u32; train_elements];
     for i in 0..ids.len() {
         ids[i] = rng.below(vocab) as u32;
         tgt[i] = rng.below(vocab) as u32;
     }
-    let steps = a.get_usize("steps", 5);
+    let steps = require_positive("steps", a.get_usize("steps", 5));
     let t3 = Instant::now();
     let mut nodes = 0usize;
     for _ in 0..steps {
@@ -304,13 +347,13 @@ fn cmd_bench(a: &Args) {
     );
 
     // ---- streaming decode ----
-    let mut st = LmState::new(&cfg);
-    let warm = infer::step(&g, &m, &mut st, 1);
+    let mut decoder = Decoder::new(&cfg);
+    let warm = decoder.step(&g, &m, 1);
     let _ = warm.len();
-    let n_dec = a.get_usize("decode", 64);
+    let n_dec = require_positive("decode", a.get_usize("decode", 64));
     let t4 = Instant::now();
     for i in 0..n_dec {
-        let _ = infer::step(&g, &m, &mut st, (i % vocab) as u32);
+        let _ = decoder.step(&g, &m, (i % vocab) as u32);
     }
     let d4 = t4.elapsed().as_secs_f64();
     println!(
@@ -330,9 +373,12 @@ fn cmd_bench(a: &Args) {
 fn cmd_bpe(a: &Args) {
     let seed = a.get_usize("seed", 1) as u64;
     let path = a.get_str("data", "");
-    let bytes = a.get_usize("bytes", 400_000);
+    let bytes = require_positive("bytes", a.get_usize("bytes", 400_000));
     let (text, synth) = data::load_or_synthesize(&path, bytes, seed);
     let vocab = a.get_usize("vocab", 512);
+    if !(256..=1_000_256).contains(&vocab) {
+        invalid_argument("vocab", &format!("{}", vocab), "an integer from 256 through 1000256");
+    }
     println!(
         "corpus: {} bytes ({})",
         fmt_int(text.len()),
@@ -382,44 +428,84 @@ fn cmd_bpe(a: &Args) {
 // generation helper
 // ---------------------------------------------------------------------------
 
+fn flush_utf8_pending<W: Write>(writer: &mut W, pending: &mut Vec<u8>, final_chunk: bool) -> std::io::Result<()> {
+    loop {
+        match std::str::from_utf8(pending) {
+            Ok(_) => {
+                writer.write_all(pending)?;
+                pending.clear();
+                return Ok(());
+            }
+            Err(error) => {
+                let valid = error.valid_up_to();
+                if valid > 0 {
+                    writer.write_all(&pending[..valid])?;
+                }
+                match error.error_len() {
+                    Some(invalid) => {
+                        writer.write_all("�".as_bytes())?;
+                        pending.drain(..valid + invalid);
+                    }
+                    None => {
+                        pending.drain(..valid);
+                        if final_chunk && !pending.is_empty() {
+                            writer.write_all(String::from_utf8_lossy(pending).as_bytes())?;
+                            pending.clear();
+                        }
+                        return Ok(());
+                    }
+                }
+            }
+        }
+    }
+}
+
 fn generate(g: &Graph, m: &Lm, b: &Bpe, prompt: &str, n: usize, scfg: &SampleCfg, rng: &mut Rng, stream: bool) -> String {
     let cfg = m.cfg;
-    let mut st = LmState::new(&cfg);
-    let mut hist: Vec<u32> = Vec::new();
+    assert_eq!(b.vocab_size(), cfg.vocab, "tokenizer vocabulary does not match the model");
+    let mut decoder = Decoder::new(&cfg);
     let mut ids = b.encode(prompt);
     if ids.is_empty() {
         ids.push(10); // newline byte token
     }
-    let mut logits: Vec<f32> = Vec::new();
-    for i in 0..ids.len() {
-        logits = infer::step(g, m, &mut st, ids[i]);
-        hist.push(ids[i]);
+    for &id in &ids {
+        let _ = decoder.step(g, m, id);
     }
-    let mut out_ids: Vec<u32> = Vec::new();
-    let mut pend: Vec<u8> = Vec::new();
-    for _ in 0..n {
-        let mut lg = logits.clone();
-        let tok = sample_token(&mut lg, scfg, &hist, rng);
-        out_ids.push(tok);
-        hist.push(tok);
-        if stream {
-            let ti = tok as usize;
-            if ti < b.token_bytes.len() {
-                pend.extend_from_slice(&b.token_bytes[ti]);
-            }
-            match std::str::from_utf8(&pend) {
-                Ok(s) => {
-                    print!("{}", s);
-                    let _ = std::io::stdout().flush();
-                    pend.clear();
-                }
-                Err(_) => {}
+
+    // Sampling only consults the repetition window, so keep exactly that much
+    // history rather than retaining an ever-growing prompt/output sequence.
+    let history_limit = scfg.rep_window;
+    let history_start = ids.len().saturating_sub(history_limit);
+    let mut history = ids[history_start..].to_vec();
+    let mut out_ids: Vec<u32> = Vec::with_capacity(n);
+    let mut pending: Vec<u8> = Vec::new();
+    let stdout = std::io::stdout();
+    let mut writer = stdout.lock();
+    for generated in 0..n {
+        let token = sample_token(decoder.logits_mut(), scfg, &history, rng);
+        out_ids.push(token);
+        if history_limit > 0 {
+            if history.len() < history_limit {
+                history.push(token);
+            } else {
+                history.rotate_left(1);
+                history[history_limit - 1] = token;
             }
         }
-        logits = infer::step(g, m, &mut st, tok);
+        if stream {
+            let token_bytes = &b.token_bytes[token as usize];
+            pending.extend_from_slice(token_bytes);
+            let _ = flush_utf8_pending(&mut writer, &mut pending, false);
+            let _ = writer.flush();
+        }
+        if generated + 1 < n {
+            let _ = decoder.step(g, m, token);
+        }
     }
     if stream {
-        println!();
+        let _ = flush_utf8_pending(&mut writer, &mut pending, true);
+        let _ = writeln!(writer);
+        let _ = writer.flush();
     }
     b.decode(&out_ids)
 }
@@ -445,7 +531,7 @@ fn cmd_train(a: &Args) {
     let mut rng = Rng::new(seed);
 
     let data_path = a.get_str("data", "");
-    let bytes = a.get_usize("bytes", 400_000);
+    let bytes = require_positive("bytes", a.get_usize("bytes", 400_000));
     let (text, synth) = data::load_or_synthesize(&data_path, bytes, seed);
     println!(
         "corpus: {} bytes ({})",
@@ -456,6 +542,9 @@ fn cmd_train(a: &Args) {
     // ---- tokenizer ----
     let tok_path = a.get_str("tok", "noetic.tok");
     let vocab_target = a.get_usize("vocab", 512);
+    if !(256..=1_000_256).contains(&vocab_target) {
+        invalid_argument("vocab", &format!("{}", vocab_target), "an integer from 256 through 1000256");
+    }
     let reuse = std::path::Path::new(&tok_path).exists() && !a.get_bool("retok", false);
     let b = if reuse {
         match Bpe::load(&tok_path) {
@@ -485,27 +574,41 @@ fn cmd_train(a: &Args) {
         fmt_int(tokens.len()),
         (text.len() as f32) / (tokens.len().max(1) as f32)
     );
+    if tokens.len() < 2 {
+        eprintln!("training corpus must encode to at least two tokens");
+        return;
+    }
     let batcher = Batcher::new(tokens, 0.05);
 
     // ---- model ----
     let cfg = LmConfig {
         vocab: b.vocab_size(),
-        d_model: a.get_usize("d", 128),
-        n_layer: a.get_usize("layers", 2),
-        expand: a.get_usize("expand", 2),
-        conv_k: a.get_usize("convk", 4),
-        mlp_mult: a.get_usize("mlp", 3),
+        d_model: require_positive("d", a.get_usize("d", 128)),
+        n_layer: require_positive("layers", a.get_usize("layers", 2)),
+        expand: require_positive("expand", a.get_usize("expand", 2)),
+        conv_k: require_positive("convk", a.get_usize("convk", 4)),
+        mlp_mult: require_positive("mlp", a.get_usize("mlp", 3)),
         eps: 1e-5,
-        tau_max: a.get_f32("taumax", 128.0),
+        tau_max: require_positive_finite("taumax", a.get_f32("taumax", 128.0)),
     };
+    if cfg.tau_max < 1.0 {
+        invalid_argument("taumax", &format!("{}", cfg.tau_max), "a finite number greater than or equal to one");
+    }
+    if let Err(message) = cfg.check() {
+        eprintln!("invalid model configuration: {}", message);
+        return;
+    }
     let mut g = Graph::new(threads);
     let m = Lm::new(&mut g, &mut rng, cfg);
     g.seal_params();
-    let steps = a.get_usize("steps", 300);
-    let batch = a.get_usize("batch", 8);
-    let ctx = a.get_usize("ctx", 64);
-    let lr = a.get_f32("lr", 3e-3);
-    let clip = a.get_f32("clip", 1.0);
+    let steps = require_positive("steps", a.get_usize("steps", 300));
+    let batch = require_positive("batch", a.get_usize("batch", 8));
+    let ctx = require_positive("ctx", a.get_usize("ctx", 64));
+    if batcher.split <= ctx {
+        invalid_argument("ctx", &format!("{}", ctx), "less than the number of training tokens");
+    }
+    let lr = require_nonnegative_finite("lr", a.get_f32("lr", 3e-3));
+    let clip = require_nonnegative_finite("clip", a.get_f32("clip", 1.0));
     let log_every = a.get_usize("log", if steps > 40 { steps / 20 } else { 1 }).max(1);
     println!(
         "model: d={} layers={} inner={} mlp={} conv_k={} vocab={} -> {} params",
@@ -522,13 +625,14 @@ fn cmd_train(a: &Args) {
         steps,
         batch,
         ctx,
-        fmt_int(batch * ctx),
+        fmt_int(batch.checked_mul(ctx).expect("tokens per step overflow")),
         threads
     );
     println!();
 
     let sched = Schedule { peak: lr, min: lr * 0.1, warmup: if steps >= 40 { steps / 20 } else { 2 }, total: steps };
-    let mut opt = AdamW::new(&g, a.get_f32("wd", 0.01));
+    let wd = require_nonnegative_finite("wd", a.get_f32("wd", 0.01));
+    let mut opt = AdamW::new(&g, wd);
     let mut ema = 0.0f32;
     let t_start = Instant::now();
     for step in 0..steps {
@@ -589,6 +693,7 @@ fn cmd_train(a: &Args) {
         ("expand".to_string(), format!("{}", cfg.expand)),
         ("conv_k".to_string(), format!("{}", cfg.conv_k)),
         ("mlp_mult".to_string(), format!("{}", cfg.mlp_mult)),
+        ("eps".to_string(), format!("{}", cfg.eps)),
         ("tau_max".to_string(), format!("{}", cfg.tau_max)),
         ("tok".to_string(), tok_path.clone()),
         ("val_loss".to_string(), format!("{}", vl)),
@@ -619,43 +724,73 @@ fn cmd_gen(a: &Args) {
     let mut rng = Rng::new(seed);
     let path = a.get_str("ckpt", "noetic.ckpt");
     let ck = match ckpt::load(&path) {
-        Ok(c) => c,
-        Err(e) => {
-            println!("could not load {}: {}", path, e);
-            println!("train one first:  cargo run --release -- train --steps 400");
+        Ok(checkpoint) => checkpoint,
+        Err(error) => {
+            eprintln!("could not load {}: {}", path, error);
+            eprintln!("train one first:  cargo run --release -- train --steps 400");
             return;
         }
     };
-    let cfg = LmConfig {
-        vocab: ck.meta_usize("vocab", 512),
-        d_model: ck.meta_usize("d_model", 128),
-        n_layer: ck.meta_usize("n_layer", 2),
-        expand: ck.meta_usize("expand", 2),
-        conv_k: ck.meta_usize("conv_k", 4),
-        mlp_mult: ck.meta_usize("mlp_mult", 3),
-        eps: 1e-5,
-        tau_max: ck.meta_f32("tau_max", 128.0),
+    let config_result: std::io::Result<LmConfig> = (|| {
+        Ok(LmConfig {
+            vocab: ck.require_usize("vocab")?,
+            d_model: ck.require_usize("d_model")?,
+            n_layer: ck.require_usize("n_layer")?,
+            expand: ck.require_usize("expand")?,
+            conv_k: ck.require_usize("conv_k")?,
+            mlp_mult: ck.require_usize("mlp_mult")?,
+            eps: ck.optional_f32("eps", 1e-5)?,
+            tau_max: ck.require_f32("tau_max")?,
+        })
+    })();
+    let cfg = match config_result {
+        Ok(config) => config,
+        Err(error) => {
+            eprintln!("checkpoint has invalid model metadata: {}", error);
+            return;
+        }
     };
-    let tok_path = a.get_str("tok", &ck.meta.get("tok").cloned().unwrap_or("noetic.tok".to_string()));
+    if let Err(message) = cfg.check() {
+        eprintln!("checkpoint model configuration is invalid: {}", message);
+        return;
+    }
+
+    let default_tokenizer = ck.meta.get("tok").cloned().unwrap_or_else(|| "noetic.tok".to_string());
+    let tok_path = a.get_str("tok", &default_tokenizer);
     let b = match Bpe::load(&tok_path) {
-        Ok(t) => t,
-        Err(e) => {
-            println!("could not load tokenizer {}: {}", tok_path, e);
+        Ok(tokenizer) => tokenizer,
+        Err(error) => {
+            eprintln!("could not load tokenizer {}: {}", tok_path, error);
             return;
         }
     };
+    if b.vocab_size() != cfg.vocab {
+        eprintln!(
+            "tokenizer/model vocabulary mismatch: tokenizer has {}, checkpoint expects {}",
+            b.vocab_size(),
+            cfg.vocab
+        );
+        return;
+    }
+
     let mut g = Graph::new(threads);
     let m = Lm::new(&mut g, &mut rng, cfg);
     g.seal_params();
-    let (loaded, missing, mismatch) = ckpt::apply(&mut g, &ck);
-    println!(
-        "loaded {} tensors from {} (missing {}, shape-mismatched {}), val loss {:.4}",
-        loaded,
-        path,
-        missing,
-        mismatch,
-        ck.meta_f32("val_loss", 0.0)
-    );
+    let loaded = match ckpt::apply_exact(&mut g, &ck) {
+        Ok(count) => count,
+        Err(error) => {
+            eprintln!("checkpoint is incompatible with the model: {}", error);
+            return;
+        }
+    };
+    let val_loss = match ck.optional_f32("val_loss", 0.0) {
+        Ok(value) => value,
+        Err(error) => {
+            eprintln!("warning: {}", error);
+            0.0
+        }
+    };
+    println!("loaded {} tensors from {}, val loss {:.4}", loaded, path, val_loss);
     let prompt = a.get_str("prompt", "the ");
     let scfg = sample_cfg_from(a);
     println!();
@@ -697,14 +832,14 @@ fn cmd_plan(a: &Args) {
     let threads = threads_of(a);
     let seed = a.get_usize("seed", 2024) as u64;
     let mut rng = Rng::new(seed);
-    let hidden = a.get_usize("hidden", 128);
-    let iters = a.get_usize("iters", 12);
-    let games = a.get_usize("games", 24);
-    let sims = a.get_usize("sims", 64);
-    let batch = a.get_usize("batch", 64);
-    let lr = a.get_f32("lr", 2e-3);
-    let max_scramble = a.get_usize("scramble", 14);
-    let max_steps = a.get_usize("maxsteps", 40);
+    let hidden = require_positive("hidden", a.get_usize("hidden", 128));
+    let iters = require_positive("iters", a.get_usize("iters", 12));
+    let games = require_positive("games", a.get_usize("games", 24));
+    let sims = require_positive("sims", a.get_usize("sims", 64));
+    let batch = require_positive("batch", a.get_usize("batch", 64));
+    let lr = require_nonnegative_finite("lr", a.get_f32("lr", 2e-3));
+    let max_scramble = a.get_usize("scramble", 14).max(4);
+    let max_steps = require_positive("maxsteps", a.get_usize("maxsteps", 40));
     let temp_moves = a.get_usize("tempmoves", 8);
 
     let mut g = Graph::new(threads);
@@ -745,8 +880,11 @@ fn cmd_plan(a: &Args) {
     println!("  self-play time {:.1} s", t0.elapsed().as_secs_f64());
 
     // ---- evaluation: search vs raw policy ----
-    let eval_n = a.get_usize("eval", 20);
+    let eval_n = require_positive("eval", a.get_usize("eval", 20));
     let eval_scramble = a.get_usize("evalscramble", max_scramble);
+    let eval_sims = sims
+        .checked_mul(2)
+        .unwrap_or_else(|| invalid_argument("sims", &format!("{}", sims), "a value that can be doubled"));
     let mut solved_search = 0usize;
     let mut solved_net = 0usize;
     let mut moves_sum = 0usize;
@@ -755,7 +893,7 @@ fn cmd_plan(a: &Args) {
     for i in 0..eval_n {
         let mut env = Puzzle::solved();
         env.scramble(eval_scramble, &mut rng);
-        let (ok, mv, nodes) = plan::solve(&env, &net, &g, &mut rng, sims * 2, max_steps);
+        let (ok, mv, nodes) = plan::solve(&env, &net, &g, &mut rng, eval_sims, max_steps);
         if ok {
             solved_search += 1;
             moves_sum += mv.len();
@@ -779,7 +917,7 @@ fn cmd_plan(a: &Args) {
     );
     println!(
         "  policy + MCTS ({} sims)  {:>5.1}% solved, avg {:.1} moves, {} nodes/board",
-        sims * 2,
+        eval_sims,
         100.0 * (solved_search as f32) / (eval_n as f32),
         if solved_search > 0 { (moves_sum as f32) / (solved_search as f32) } else { 0.0 },
         fmt_int(nodes_sum / eval_n.max(1))
@@ -809,9 +947,9 @@ fn cmd_plan(a: &Args) {
 // ---------------------------------------------------------------------------
 
 fn cmd_mem(a: &Args) {
-    let bits = a.get_usize("bits", 512);
-    let loc = a.get_usize("loc", 4096);
-    let n_pat = a.get_usize("patterns", 50);
+    let bits = require_positive("bits", a.get_usize("bits", 512));
+    let loc = require_positive("loc", a.get_usize("loc", 4096));
+    let n_pat = require_positive("patterns", a.get_usize("patterns", 50));
     let seed = a.get_usize("seed", 5) as u64;
     let mut rng = Rng::new(seed);
     let radius = a.get_usize("radius", Sdm::default_radius(bits));
@@ -870,7 +1008,7 @@ fn cmd_mem(a: &Args) {
     println!();
     println!("  heteroassociative binding (recall a value from a corrupted key):");
     let mut mem2 = Sdm::new(bits, loc, radius, seed ^ 0xBEEF);
-    let n_kv = a.get_usize("kv", 20);
+    let n_kv = require_positive("kv", a.get_usize("kv", 20));
     let mut keys: Vec<Vec<u64>> = Vec::new();
     let mut vals: Vec<Vec<u64>> = Vec::new();
     for _ in 0..n_kv {

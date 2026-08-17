@@ -24,14 +24,13 @@ pub struct LmState {
 
 impl LmState {
     pub fn new(cfg: &LmConfig) -> LmState {
-        assert!(cfg.d_model > 0, "d_model must be positive");
-        assert!(cfg.expand > 0, "expand must be positive");
-        assert!(cfg.conv_k > 0, "conv_k must be positive");
+        cfg.validate();
         let e = cfg.inner();
+        let conv_len = cfg.conv_k.checked_mul(e).expect("streaming convolution state is too large");
         let mut layers = Vec::with_capacity(cfg.n_layer);
         for _ in 0..cfg.n_layer {
             layers.push(LayerState {
-                conv: vec![0.0f32; cfg.conv_k * e],
+                conv: vec![0.0f32; conv_len],
                 conv_head: cfg.conv_k - 1,
                 h: vec![0.0f32; e],
             });
@@ -49,46 +48,120 @@ impl LmState {
     }
 }
 
-/// Advance the model by one token, mutating `st`. Returns logits over vocab.
-pub fn step(g: &Graph, m: &Lm, st: &mut LmState, token: u32) -> Vec<f32> {
+struct DecoderScratch {
+    x: Vec<f32>,
+    norm: Vec<f32>,
+    projection: Vec<f32>,
+    conv_value: Vec<f32>,
+    gated_state: Vec<f32>,
+    residual: Vec<f32>,
+    up: Vec<f32>,
+    gated_mlp: Vec<f32>,
+    logits: Vec<f32>,
+}
+
+impl DecoderScratch {
+    fn new(cfg: &LmConfig) -> DecoderScratch {
+        cfg.validate();
+        let d = cfg.d_model;
+        let e = cfg.inner();
+        let hidden = cfg.hidden();
+        DecoderScratch {
+            x: vec![0.0; d],
+            norm: vec![0.0; d],
+            projection: vec![0.0; cfg.recurrent_projection()],
+            conv_value: vec![0.0; e],
+            gated_state: vec![0.0; e],
+            residual: vec![0.0; d],
+            up: vec![0.0; cfg.mlp_projection()],
+            gated_mlp: vec![0.0; hidden],
+            logits: vec![0.0; cfg.vocab],
+        }
+    }
+}
+
+/// Stateful streaming decoder that reuses every scratch buffer across tokens.
+pub struct Decoder {
+    pub state: LmState,
+    scratch: DecoderScratch,
+}
+
+impl Decoder {
+    pub fn new(cfg: &LmConfig) -> Decoder {
+        Decoder { state: LmState::new(cfg), scratch: DecoderScratch::new(cfg) }
+    }
+
+    pub fn reset(&mut self) {
+        self.state.reset();
+    }
+
+    pub fn logits_mut(&mut self) -> &mut [f32] {
+        &mut self.scratch.logits
+    }
+
+    /// Advance by one token and return the reusable logit buffer. The returned
+    /// slice is overwritten by the next call.
+    pub fn step<'a>(&'a mut self, g: &Graph, m: &Lm, token: u32) -> &'a mut [f32] {
+        step_with_scratch(g, m, &mut self.state, &mut self.scratch, token);
+        &mut self.scratch.logits
+    }
+}
+
+fn step_with_scratch(g: &Graph, m: &Lm, st: &mut LmState, scratch: &mut DecoderScratch, token: u32) {
     let cfg = m.cfg;
     let d = cfg.d_model;
     let e = cfg.inner();
     let k = cfg.conv_k;
     let hidden = cfg.hidden();
+    let recurrent_projection = cfg.recurrent_projection();
+    let mlp_projection = cfg.mlp_projection();
     let threads = g.threads;
 
     assert!((token as usize) < cfg.vocab, "streaming token is outside the vocabulary");
     assert_eq!(st.layers.len(), cfg.n_layer, "streaming state has the wrong layer count");
+    assert_eq!(scratch.x.len(), d, "decoder scratch has the wrong model width");
+    assert_eq!(scratch.norm.len(), d, "decoder norm scratch has the wrong width");
+    assert_eq!(scratch.projection.len(), recurrent_projection, "decoder projection scratch has the wrong width");
+    assert_eq!(scratch.conv_value.len(), e, "decoder convolution scratch has the wrong width");
+    assert_eq!(scratch.gated_state.len(), e, "decoder recurrent scratch has the wrong width");
+    assert_eq!(scratch.residual.len(), d, "decoder residual scratch has the wrong width");
+    assert_eq!(scratch.up.len(), mlp_projection, "decoder MLP scratch has the wrong width");
+    assert_eq!(scratch.gated_mlp.len(), hidden, "decoder gated MLP scratch has the wrong width");
+    assert_eq!(scratch.logits.len(), cfg.vocab, "decoder logit scratch has the wrong vocabulary");
 
-    let mut x = vec![0.0f32; d];
+    let DecoderScratch {
+        x,
+        norm,
+        projection,
+        conv_value,
+        gated_state,
+        residual,
+        up,
+        gated_mlp,
+        logits,
+    } = scratch;
     let base = (token as usize) * d;
     x.copy_from_slice(&g.val[m.emb][base..base + d]);
-
-    // Scratch is allocated once per token rather than once per layer.
-    let mut norm = vec![0.0f32; d];
-    let mut projection = vec![0.0f32; 3 * e];
-    let mut conv_value = vec![0.0f32; e];
-    let mut gated_state = vec![0.0f32; e];
-    let mut residual = vec![0.0f32; d];
-    let mut up = vec![0.0f32; 2 * hidden];
-    let mut gated_mlp = vec![0.0f32; hidden];
 
     for layer_index in 0..cfg.n_layer {
         let block = &m.blocks[layer_index];
         let state = &mut st.layers[layer_index];
         assert_eq!(state.h.len(), e, "streaming recurrent state has the wrong width");
-        assert_eq!(state.conv.len(), k * e, "streaming convolution state has the wrong shape");
+        assert_eq!(
+            state.conv.len(),
+            k.checked_mul(e).expect("streaming convolution size overflow"),
+            "streaming convolution state has the wrong shape"
+        );
 
         // ---- recurrent branch ----
-        rms_norm_vec(&x, &g.val[block.norm1.g], cfg.eps, &mut norm);
+        rms_norm_vec(x.as_slice(), &g.val[block.norm1.g], cfg.eps, norm.as_mut_slice());
         let in_bias = block.ssm.in_proj.b.map(|id| &g.val[id][..]);
         matvec_nt(
             &g.val[block.ssm.in_proj.w],
             in_bias,
-            &norm,
-            &mut projection,
-            3 * e,
+            norm.as_slice(),
+            projection.as_mut_slice(),
+            recurrent_projection,
             d,
             threads,
         );
@@ -120,8 +193,8 @@ pub fn step(g: &Graph, m: &Lm, st: &mut LmState, token: u32) -> Vec<f32> {
         matvec_nt(
             &g.val[block.ssm.out_proj.w],
             out_bias,
-            &gated_state,
-            &mut residual,
+            gated_state.as_slice(),
+            residual.as_mut_slice(),
             d,
             e,
             threads,
@@ -131,14 +204,14 @@ pub fn step(g: &Graph, m: &Lm, st: &mut LmState, token: u32) -> Vec<f32> {
         }
 
         // ---- feed-forward branch ----
-        rms_norm_vec(&x, &g.val[block.norm2.g], cfg.eps, &mut norm);
+        rms_norm_vec(x.as_slice(), &g.val[block.norm2.g], cfg.eps, norm.as_mut_slice());
         let up_bias = block.mlp.up.b.map(|id| &g.val[id][..]);
         matvec_nt(
             &g.val[block.mlp.up.w],
             up_bias,
-            &norm,
-            &mut up,
-            2 * hidden,
+            norm.as_slice(),
+            up.as_mut_slice(),
+            mlp_projection,
             d,
             threads,
         );
@@ -149,8 +222,8 @@ pub fn step(g: &Graph, m: &Lm, st: &mut LmState, token: u32) -> Vec<f32> {
         matvec_nt(
             &g.val[block.mlp.down.w],
             down_bias,
-            &gated_mlp,
-            &mut residual,
+            gated_mlp.as_slice(),
+            residual.as_mut_slice(),
             d,
             hidden,
             threads,
@@ -160,10 +233,24 @@ pub fn step(g: &Graph, m: &Lm, st: &mut LmState, token: u32) -> Vec<f32> {
         }
     }
 
-    rms_norm_vec(&x, &g.val[m.norm_f.g], cfg.eps, &mut norm);
-    let mut logits = vec![0.0f32; cfg.vocab];
-    matvec_nt(&g.val[m.emb], None, &norm, &mut logits, cfg.vocab, d, threads);
-    logits
+    rms_norm_vec(x.as_slice(), &g.val[m.norm_f.g], cfg.eps, norm.as_mut_slice());
+    matvec_nt(
+        &g.val[m.emb],
+        None,
+        norm.as_slice(),
+        logits.as_mut_slice(),
+        cfg.vocab,
+        d,
+        threads,
+    );
+}
+
+/// Advance the model by one token, mutating `st`. Returns logits over vocab.
+/// Prefer [`Decoder`] when processing multiple tokens so scratch is reused.
+pub fn step(g: &Graph, m: &Lm, st: &mut LmState, token: u32) -> Vec<f32> {
+    let mut scratch = DecoderScratch::new(&m.cfg);
+    step_with_scratch(g, m, st, &mut scratch, token);
+    scratch.logits
 }
 
 /// Decoding controls. All are pure post-processing on the logit vector.
@@ -216,8 +303,7 @@ pub fn sample_token(logits: &mut [f32], cfg: &SampleCfg, history: &[u32], rng: &
     for logit in logits.iter_mut() {
         *logit /= temperature;
     }
-    let mut probabilities = logits.to_vec();
-    softmax_inplace(&mut probabilities);
+    softmax_inplace(logits);
 
     let keep = if cfg.top_k == 0 || cfg.top_k > vocab {
         vocab
@@ -225,22 +311,61 @@ pub fn sample_token(logits: &mut [f32], cfg: &SampleCfg, history: &[u32], rng: &
         cfg.top_k
     };
     let mut indices: Vec<usize> = (0..vocab).collect();
-    indices.sort_unstable_by(|&left, &right| probabilities[right].total_cmp(&probabilities[left]));
+    if keep < vocab {
+        indices.select_nth_unstable_by(keep, |left, right| {
+            let order = logits[*right].total_cmp(&logits[*left]);
+            if order == std::cmp::Ordering::Equal { left.cmp(right) } else { order }
+        });
+        indices.truncate(keep);
+    }
+    indices.sort_unstable_by(|left, right| {
+        let order = logits[*right].total_cmp(&logits[*left]);
+        if order == std::cmp::Ordering::Equal { left.cmp(right) } else { order }
+    });
 
-    let top_p = if cfg.top_p.is_finite() { cfg.top_p } else { 1.0 };
+    // p <= 0 has the useful deterministic interpretation "keep the best one".
+    let top_p = if cfg.top_p.is_finite() { cfg.top_p.clamp(0.0, 1.0) } else { 1.0 };
     let mut cumulative = 0.0f32;
     let mut kept = 0usize;
-    for &index in indices.iter().take(keep) {
-        cumulative += probabilities[index];
+    for &index in &indices {
+        cumulative += logits[index];
         kept += 1;
-        if top_p > 0.0 && top_p < 1.0 && cumulative >= top_p {
+        if cumulative >= top_p {
             break;
         }
     }
 
-    let mut weights = Vec::with_capacity(kept);
-    for &index in indices.iter().take(kept) {
-        weights.push(probabilities[index]);
+    let candidates = &indices[..kept.max(1)];
+    let total = candidates.iter().map(|&index| logits[index] as f64).sum::<f64>();
+    if !total.is_finite() || total <= 0.0 {
+        return candidates[rng.below(candidates.len())] as u32;
     }
-    indices[rng.categorical(&weights)] as u32
+    let mut draw = (rng.f32_unit() as f64) * total;
+    for &index in candidates {
+        draw -= logits[index] as f64;
+        if draw <= 0.0 {
+            return index as u32;
+        }
+    }
+    candidates[candidates.len() - 1] as u32
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn zero_nucleus_probability_keeps_exactly_the_best_token() {
+        let config = SampleCfg {
+            temperature: 1.0,
+            top_k: 0,
+            top_p: 0.0,
+            rep_penalty: 1.0,
+            rep_window: 0,
+            greedy: false,
+        };
+        let mut logits = [f32::NAN, f32::INFINITY, f32::INFINITY, -2.0];
+        let mut rng = Rng::new(7);
+        assert_eq!(sample_token(&mut logits, &config, &[], &mut rng), 1);
+    }
 }
