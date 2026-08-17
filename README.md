@@ -1,158 +1,94 @@
 # noetic
 
-**A from-scratch neural intelligence stack in pure Rust. No transformer. No attention. No dependencies. Not even one crate.**
+A from-scratch neural-computing playground in stable Rust, built with the standard library only.
+
+Noetic combines a selective linear-recurrent language model, reverse-mode autodiff, byte-level BPE, optimizers, checkpointing, sparse distributed memory, and neural-guided Monte Carlo tree search. It intentionally uses neither transformers nor self-attention.
 
 ```toml
 [dependencies]
 # intentionally empty
 ```
 
-`std` only. No `ndarray`, no `rayon`, no `rand`, no `serde`, no `tch`/`candle`/`burn`/`onnx`, no BLAS, no `unsafe`, no nightly features. Every matrix multiply, every gradient, every random number, every byte of the serialization format, every thread pool is written by hand in this repo — ~5,400 lines across 15 modules.
+> **Status:** experimental and educational. The crate is compiled and tested in CI on Rust 1.70 and the latest stable toolchain, but it is not a production ML framework or a substitute for audited numerical libraries.
 
----
+## Why a linear recurrence?
 
-## Why not a transformer?
+The sequence core is the elementwise recurrence
 
-Self-attention costs `O(T^2)` compute and an `O(T)` KV-cache per token. This engine replaces it with a **selective gated linear recurrence** — a diagonal state-space model in the Mamba/S4/RWKV/linear-RNN family — whose core is one associative primitive:
-
-```
-h_t = a_t ⊙ h_{t-1} + b_t          a_t, b_t, h_t ∈ R^E    (elementwise, diagonal state)
+```text
+h_t = a_t ⊙ h_{t-1} + b_t
 ```
 
-`a_t` and `b_t` are **produced by the network from the current token** (that is the *selective* part: the recurrence's own time constants are data-dependent, which is what buys attention-like content routing without attention). Because affine maps compose associatively,
+where the network derives `a_t` and `b_t` from the current token. Affine state transitions compose associatively:
 
+```text
+(a_L, b_L) then (a_R, b_R) = (a_R·a_L, a_R·b_L + b_R)
 ```
-(a_L, b_L) ∘ (a_R, b_R) = (a_R·a_L,  a_R·b_L + b_R)
-```
 
-the whole sequence can be evaluated by a **prefix scan** instead of a serial loop. Consequences:
+That permits either a sequential scan or a log-depth parallel prefix scan. Training work scales linearly with sequence length, while streaming generation keeps a fixed-size recurrent state instead of a growing KV cache.
 
-| | transformer | noetic |
-|---|---|---|
-| train cost / sequence | `O(T² d)` | `O(T d)` work, `O(log T)` depth |
-| generation state | KV cache, grows with `T` | fixed `E` floats per layer |
-| cost per generated token | grows with context | **constant, forever** |
-| context limit | quadratic wall | none in principle |
-
-Two scan strategies ship, and the self-test asserts they agree:
-
-* `scan_sequential` — `O(T)` work, threaded across batch. Best for training.
-* `scan_log_depth` — Hillis–Steele double-buffered prefix scan, `O(T log T)` work but `O(log T)` **depth**, threaded across *time*. Best for one very long sequence on many cores.
-
-Stability is structural rather than hoped-for: `a_t = σ(z_t) ∈ (0,1)` and `b_t = (1 - a_t) ⊙ v_t`, making each state update a convex blend, so `|h| ≤ max|v|` for any sequence length. Verified empirically at `T = 4000` with zero growth.
-
----
-
-## What's in the box
-
-Seven subsystems, all hand-rolled, all wired into one CLI:
-
-1. **Tensor / BLAS layer** — cache-blocked, multithreaded `gemm` in three transpose modes with 4×-unrolled inner loops and hand-written micro-kernels.
-2. **Reverse-mode autodiff** — a flat tape with 24 fused ops, arena-allocated gradients, `mem::take` borrow trickery instead of `Rc<RefCell<…>>`, topological reverse sweep, gradient-norm clipping, `no_grad` inference mode.
-3. **The language model** — depthwise causal conv + selective gated linear recurrence + SwiGLU, RMSNorm pre-norm residual stack, weight-tied vocabulary head, log-spaced decay-spectrum initialization.
-4. **Byte-level BPE tokenizer** — trained from scratch with an inverted pair index; lossless on arbitrary bytes, so emoji and CJK round-trip exactly.
-5. **Optimizers** — AdamW (decoupled decay, bias correction) and Lion (sign-momentum), cosine schedule with warmup.
-6. **Streaming inference** — an `O(1)`-per-token recurrent decoder with temperature / top-k / nucleus / repetition-penalty sampling, plus a batch-vs-stream equivalence test.
-7. **Two non-gradient intelligences** — a **Kanerva sparse distributed memory** (associative recall from corrupted cues) and an **AlphaZero-style planner** (PUCT MCTS + self-play policy/value learning on a symbolic puzzle) that solves tasks gradient descent alone cannot.
-
----
+The update uses `a_t = sigmoid(z_t)` and `b_t = (1 - a_t) ⊙ v_t`, making each recurrent update a convex blend when `v_t` is bounded.
 
 ## Architecture
 
-```
-tokens ──► embedding (weight-tied with output head)
-             │
-     ┌───────▼─────────────────────── Block × n_layer ──────────────┐
-     │  x += SSM( RMSNorm(x) )                                      │
-     │  x += SwiGLU( RMSNorm(x) )                                   │
-     └───────┬──────────────────────────────────────────────────────┘
-             ▼
-        RMSNorm ──► xᵀ · Eᵀ ──► logits ──► softmax cross-entropy
+```text
+tokens -> tied embedding
+            |
+            +-> [ RMSNorm -> selective SSM -> residual
+            |    RMSNorm -> SwiGLU       -> residual ] x n_layer
+            |
+            +-> RMSNorm -> tied vocabulary projection -> logits
 ```
 
-Inside one SSM layer (`d_model → E = expand · d_model → d_model`):
+Inside an SSM layer:
 
-```
-u            = x · W_inᵀ + b_in                      # one GEMM → 3E channels
-v, z, o      = split(u, E, E, E)                     # value / gate / output gate
-v            = depthwise_causal_conv_k(v) ──► SiLU   # local mixing, K taps, per-channel
-a            = σ(z)                                  # data-dependent forgetting, (0,1)
-b            = (1 − a) ⊙ v                           # convex-blend input
-h            = scan(a, b)                            # h_t = a_t h_{t-1} + b_t
-y            = h ⊙ SiLU(o)                           # multiplicative output gate
-out          = y · W_outᵀ + b_out
-```
-
-The conv gives short-range, position-precise mixing (what induction heads do cheaply); the scan gives unbounded-range memory; the gate `o` decides what to read out of the state. Nothing here is quadratic in `T`.
-
-### Decay-spectrum initialization
-
-The gate bias for channel `j` is initialized so that at `z = bias`
-
-```
-τ_j = τ_max^(j / (E−1)),   a_j = exp(−1/τ_j),   bias_j = logit(a_j)
+```text
+u       = x W_in^T + b_in       # 3E channels
+v,z,o   = split(u)
+v       = SiLU(causal_depthwise_conv(v))
+a       = sigmoid(z)
+b       = (1-a) ⊙ v
+h       = scan(a,b)
+y       = h ⊙ SiLU(o)
+out     = y W_out^T + b_out
 ```
 
-so channel 0 starts as a one-step reflex and channel `E−1` as a `τ_max`-step (default 128) integrator, with a log-spaced spectrum in between. The model therefore begins life with a *multi-timescale prior* and learns to deviate, instead of having to discover long memory from a random start — the single highest-leverage trick for training linear-recurrent models without warm-up pathologies.
+The streaming decoder uses a circular convolution buffer, so it does not shift the full `K x E` history on every token.
 
-### The autodiff tape
+## Components
 
-`Graph` is three parallel arenas (`val`, `grad`, `shape`) plus an op tape. Ops: `Add Sub Mul Scale OneMinus AddRow MulRow MatMulNN MatMulNT Silu Gelu Sigmoid Tanh RmsNorm SliceCols Embed Scan DwConv SoftmaxCe SoftCeDist MseTarget Sum Leaf`. Backward is one reverse pass with a `match` on the op — no boxed closures, no dynamic dispatch, no reference counting. RMSNorm caches its `1/rms` per row in an aux arena so the backward pass is a single fused kernel:
+| File | Responsibility |
+|---|---|
+| `tensor.rs` | Threaded `f32` GEMM variants, matrix-vector products, and vector primitives |
+| `scan.rs` | Sequential scan, log-depth scan, and reverse-time adjoint |
+| `autograd.rs` | Flat-arena reverse-mode tape and fused operators |
+| `nn.rs` | Linear layers, RMSNorm, and SwiGLU |
+| `model.rs` | Validated language-model configuration and selective SSM stack |
+| `infer.rs` | Fixed-state streaming decode and sampling controls |
+| `optim.rs` | AdamW, Lion, and warmup/cosine schedule |
+| `bpe.rs` | Strictly serialized byte-level BPE with exact raw-byte round trips |
+| `data.rs` | Synthetic corpus and bounds-checked random crop batching |
+| `ckpt.rs` | Versioned, CRC-protected, shape-validated checkpoints |
+| `sdm.rs` | Kanerva sparse distributed memory and random projection hashing |
+| `plan.rs` | 8-puzzle environment, PUCT MCTS, and self-play policy/value learning |
+| `rng.rs` | SplitMix64/xoshiro256++ and common distributions |
+| `selftest.rs` | Kernel, gradient, learning, serialization, memory, and parity regressions |
+| `verify_math.py` | Independent numerical checks of core derivations |
+| `verify_structure.py` | Compiler-independent structural checks |
 
-```
-r = 1/√(mean(x²)+ε)
-dx = r·ḡ − (r³·⟨ḡ,x⟩/d)·x
-```
+The Rust files currently live at the repository root; `Cargo.toml` declares `main.rs` explicitly as the binary target.
 
-The scan's adjoint is the same recurrence run backwards in time:
+## Requirements
 
-```
-c_t = ḡ_t + a_{t+1}·c_{t+1},     ∂L/∂b_t = c_t,     ∂L/∂a_t = c_t · h_{t-1}
-```
+- Rust 1.70 or newer
+- No native libraries or third-party crates
+- Python 3 only for the optional independent verifier scripts
 
-which is why training memory is `O(T·E)` and not `O(T²)`.
-
-### The planner
-
-Gradient descent is one kind of intelligence; **search** is another. `plan.rs` implements a full AlphaZero-lite loop over a symbolic sliding/rotation puzzle:
-
-* PUCT selection `Q + c·P·√N_parent/(1+N)`, first-play urgency seeded from the parent value, Dirichlet root noise, discounted value backup, transposition-free tree arena.
-* A policy+value network (shared trunk, two heads) trained on **MCTS visit-count distributions** (distribution-target cross-entropy) and **clamped discounted returns** (MSE) from its own games.
-* Curriculum scrambling: the scramble depth ramps up as the agent gets stronger, and the evaluation reports policy-only vs policy+search solve rates so you can watch search amplify a weak network.
-
-### The memory
-
-`sdm.rs` is Kanerva's Sparse Distributed Memory: random hard locations in `{0,1}^N`, activation by Hamming radius, integer counters per bit, content-addressable reads that **converge to a stored pattern from a corrupted cue** — plus iterated recall (feeding the read back in) and key→value binding. It's a one-shot writable associative memory with no gradients at all, and it degrades gracefully instead of catastrophically.
-
----
-
-## Module map
-
-| file | lines | what it is |
-|---|---|---|
-| `src/rng.rs` | 223 | splitmix64 + xoshiro256++ core; uniform, normal (Box–Muller), exponential, Gumbel, Marsaglia–Tsang gamma, Dirichlet, categorical, Fisher–Yates, splittable streams |
-| `src/tensor.rs` | 314 | cache-blocked multithreaded `gemm_nn` / `gemm_nt` / `gemm_tn`, naive reference kernel for testing, fused `matvec_nt`, sigmoid/SiLU/GELU, RMSNorm, softmax, argmax |
-| `src/scan.rs` | 154 | the associative recurrence: sequential scan, Hillis–Steele log-depth scan, reverse-time adjoint |
-| `src/autograd.rs` | 1046 | the tape: 24 ops, forward constructors, one giant reverse sweep, grad-norm clip, param registry |
-| `src/nn.rs` | 92 | Linear, RmsNorm, SwiGLU, fan-in-scaled init |
-| `src/model.rs` | 194 | `LmConfig`, `SsmLayer` (conv + selective recurrence + gates), `Block`, `Lm` with tied head and loss |
-| `src/optim.rs` | 131 | AdamW, Lion, cosine-with-warmup schedule |
-| `src/infer.rs` | 232 | `O(1)`/token streaming decoder with per-layer state + conv ring buffer; temperature / top-k / top-p / repetition penalty |
-| `src/bpe.rs` | 288 | byte-level BPE trainer with inverted pair index, encode/decode, on-disk format |
-| `src/data.rs` | 130 | synthetic curriculum generator (grammar, arithmetic, long-range memo→query, counting) + batcher |
-| `src/ckpt.rs` | 219 | hand-rolled binary checkpoint format with CRC32 integrity and a string→f32/usize metadata block |
-| `src/sdm.rs` | 206 | sparse distributed memory, sign-LSH projection, iterated recall |
-| `src/plan.rs` | 257+ | puzzle env, policy/value net, PUCT MCTS, self-play training loop |
-| `src/selftest.rs` | — | 11 assertions covering GEMM, scan equivalence, analytic-vs-numeric gradients, batch-vs-stream parity, optimizer, learning, tokenizer, checkpoint, memory, RNG statistics |
-| `src/main.rs` | — | argument parser and seven subcommands |
-
----
-
-## Usage
+## Quick start
 
 ```bash
-cargo run --release -- selftest          # 11 correctness gates, incl. finite-difference gradient checks
-cargo run --release -- bench             # GEMM GFLOP/s, scan throughput, train step/s, decode tok/s
+cargo run --release -- selftest
+cargo run --release -- bench
 cargo run --release -- bpe --bytes 400000 --vocab 1024
 cargo run --release -- train --steps 600 --d 192 --layers 3 --ctx 128 --taumax 128
 cargo run --release -- gen --ckpt noetic.ckpt --prompt "memo alpha = " --temp 0.8 --topp 0.95
@@ -160,69 +96,107 @@ cargo run --release -- plan --iters 12 --games 24 --sims 64 --scramble 14
 cargo run --release -- mem --bits 512 --loc 4096 --patterns 50
 ```
 
-Every command takes `--seed` and `--threads`. `train` writes `noetic.ckpt` + `noetic.tok`; `gen` reconstructs the exact architecture from the checkpoint's metadata block, so you never have to re-specify hyperparameters.
+Run `cargo run --release -- help` for the full command summary.
 
-Start with `selftest` — it is the proof that the autodiff is right (analytic gradients vs central finite differences on 48 random parameter coordinates of the real model, plus scan-gradient, batch-vs-stream, and optimizer-convergence checks).
-
-### Recommended first run
+### Recommended validation
 
 ```bash
-cargo run --release -- selftest && \
-cargo run --release -- train --steps 800 --d 192 --layers 3 --ctx 128 --batch 12 --vocab 512 && \
-cargo run --release -- gen --prompt "memo gamma = quiet river ; query gamma"
+cargo check --all-targets
+cargo test --all-targets
+cargo run --release -- selftest --threads 2
+python3 verify_math.py
+python3 verify_structure.py
 ```
 
-The `memo … ; query …` task in the synthetic corpus is deliberately a **long-range retrieval** test: the answer appears far earlier in the stream, so the loss can only drop if the recurrent state actually carried the binding forward. It's the non-attention analogue of an induction-head probe.
+CI runs all of these on every pull request. The build matrix covers the declared MSRV (`1.70.0`) and current stable Rust.
 
----
+## Training and generation
 
-## Honest status of verification
+Train on a text file:
 
-This code was authored in a sandbox with **no Rust toolchain and no network access** (`rustc`/`cargo` absent, no package manager, no way to fetch them). So, plainly:
+```bash
+cargo run --release -- train \
+  --data corpus.txt \
+  --vocab 1024 \
+  --d 192 \
+  --layers 3 \
+  --ctx 128 \
+  --batch 12 \
+  --steps 1500 \
+  --out noetic.ckpt \
+  --tok noetic.tok
+```
 
-**It has not been compiled or executed here.** Expect to fix a small number of mechanical compile errors on first `cargo build` — that is the honest expectation for 5.4k lines of uncompiled Rust, and the design deliberately avoids the constructs that usually make such fixes hard: no `unsafe`, no lifetimes beyond `std::thread::scope`, no trait objects, no generics-heavy abstractions, no macros, index-based loops throughout.
+If `--data` is omitted or cannot provide content, the CLI uses its synthetic curriculum. The curriculum mixes grammar, arithmetic, counting, and delayed memo/query examples.
 
-What *was* verified instead, mechanically:
+Generate from the resulting files:
 
-* **Structural pass over all 15 files** — comment/string/char-literal-aware delimiter balance, every `mod` resolving to a file, every `use crate::m::{…}` symbol existing as a `pub` item in the target module, every `g.method(…)` call existing on `Graph`, and format-string placeholder counts matching argument counts. Zero problems reported.
-* **Independent numeric validation of every derivation** (re-implemented in Python from the Rust source and checked against central finite differences):
+```bash
+cargo run --release -- gen \
+  --ckpt noetic.ckpt \
+  --tok noetic.tok \
+  --prompt "memo gamma = " \
+  --n 160 \
+  --temp 0.9 \
+  --topk 40 \
+  --topp 0.95
+```
 
-| derivation | max error |
-|---|---|
-| log-depth scan ≡ sequential recurrence | 8.9e-16 |
-| scan gradient `∂L/∂a`, `∂L/∂b` vs finite diff | 8.2e-11 |
-| RMSNorm gradient vs finite diff | 1.9e-11 |
-| softmax-CE gradient vs finite diff | 1.9e-11 |
-| distribution-target CE gradient (MCTS policy loss) | 2.3e-11 |
-| depthwise causal conv gradient | 7.9e-11 |
-| SiLU derivative | 9.3e-11 |
-| decay-spectrum init round-trip | 1.1e-16 |
-| convex-blend state bounded at `T = 4000` | 0.0 |
+Sampling supports temperature, top-k, nucleus filtering, greedy decoding, and a once-per-token repetition penalty over a bounded recent window.
 
-The in-repo `selftest` command re-checks all of this *inside Rust*, against the real tape and the real model, once you have a compiler.
+## File-format safety
 
----
+Checkpoint loading validates:
 
-## Scaling guidance
+- magic and exact format version
+- CRC-32 over the complete payload
+- UTF-8 metadata and tensor names
+- duplicate entries
+- bounded rank and entry counts
+- shape-product versus element-count consistency
+- exact live tensor shapes during application
+- trailing or truncated data
 
-Defaults are tuned for a 2-core box (`d_model 128`, `n_layer 2`, `expand 2`, `ctx 64` — about half a million parameters). The architecture scales without code changes:
+Checkpoint and tokenizer saves use write-then-rename behavior to avoid replacing a valid file with a partial write.
 
-| target | flags |
-|---|---|
-| laptop, minutes | `--d 192 --layers 3 --ctx 128 --batch 12 --steps 1500` |
-| workstation, hours | `--d 512 --layers 8 --expand 2 --ctx 512 --batch 32 --steps 50000 --vocab 4096 --taumax 512` |
-| real corpus | `--corpus your.txt --bytes 50000000 --vocab 8192` |
+Tokenizer loading rejects malformed counts, unknown token references, duplicate merge pairs, extra fields, and trailing records. `encode_bytes` and `decode_bytes` provide exact round trips for arbitrary bytes; the text API retains UTF-8-aware pre-tokenization.
 
-Rules of thumb: keep `expand = 2`; raise `--taumax` roughly with context length (it sets the longest initial memory timescale); `--lr` around `3e-3` for `d ≤ 256` and `1e-3` for `d ≥ 512`; batch × ctx tokens per step should stay ≥ 4k for stable gradients; `--threads` defaults to the detected core count. Compute per token is `~O(n_layer · d²)` and is completely independent of context length — doubling the context doubles training work linearly and changes generation cost **not at all**.
+## Verification coverage
 
-### Natural extensions
+The built-in self-test covers:
 
-* Multi-head / block-diagonal state (`h ∈ R^{H×E/H}`) with per-head decay spectra.
-* Bidirectional scan for encoder tasks (run the scan forward and reverse, concatenate).
-* Chunked parallel scan (`O(T/C)` sequential steps over `C`-length chunks) for the best of both scan strategies on long single sequences.
-* Quantized `i8` GEMM in `tensor.rs` — the kernels are already blocked and isolated behind three functions.
-* Wire the SDM in as an external retrieval memory the LM can read from, and the MCTS planner as a search layer over LM-proposed actions.
+1. three GEMM layouts against an independent `f64` reference
+2. sequential versus log-depth scan equivalence
+3. scan gradients versus central finite differences
+4. full-model parameter gradients versus finite differences
+5. batched versus streaming logits
+6. AdamW convergence
+7. end-to-end learning on a fixed mapping
+8. Unicode and arbitrary-byte BPE round trips
+9. checkpoint round trips plus corruption detection
+10. sparse-memory recall from an exactly corrupted cue
+11. RNG moment and uniformity checks
 
----
+`verify_math.py` independently checks the scan, scan adjoint, RMSNorm, softmax cross-entropy, distribution-target cross-entropy, depthwise convolution, SiLU derivative, decay initialization, and long-sequence state boundedness.
 
-Built as one artifact: linear algebra, automatic differentiation, a sequence architecture, a tokenizer, optimizers, serialization, associative memory, and planning — all from arithmetic up, with an empty dependency list.
+## Performance notes
+
+- Release builds enable `opt-level=3`, fat LTO, one codegen unit, symbol stripping, and abort-on-panic.
+- GEMM and scan kernels use scoped standard-library threads over disjoint output regions.
+- The autodiff graph stores nodes in parallel arenas and truncates activations back to a watermark between steps.
+- Streaming inference allocates scratch once per token and reuses it across layers; convolution history is circular.
+- BPE training maintains an exact inverted pair index so stale word memberships do not accumulate.
+
+Always measure on the target machine with `cargo run --release -- bench`; no universal throughput number is claimed.
+
+## Limitations
+
+- CPU-only scalar Rust; no SIMD intrinsics, BLAS, GPU, distributed training, or mixed precision
+- experimental checkpoint and tokenizer formats with no backward-compatibility promise beyond their explicit version
+- basic hand-written CLI parsing rather than a full argument-schema library
+- MCTS intentionally uses a simple tree without transposition-table reuse
+- model quality depends on data, scale, and training time; the architecture alone does not imply competitive language-model quality
+
+## License
+
+MIT. See `LICENSE`.
