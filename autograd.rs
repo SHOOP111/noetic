@@ -20,6 +20,27 @@ use crate::tensor::{gemm_nn, gemm_nt, gemm_tn, sigmoid};
 
 pub type Nid = usize;
 
+#[inline]
+fn checked_numel(shape: &[usize]) -> usize {
+    shape
+        .iter()
+        .try_fold(1usize, |product, &dimension| product.checked_mul(dimension))
+        .expect("tensor shape product overflow")
+}
+
+#[inline]
+fn checked_2(left: usize, right: usize, what: &str) -> usize {
+    left.checked_mul(right).unwrap_or_else(|| panic!("{} size overflow", what))
+}
+
+#[inline]
+fn checked_3(first: usize, second: usize, third: usize, what: &str) -> usize {
+    first
+        .checked_mul(second)
+        .and_then(|value| value.checked_mul(third))
+        .unwrap_or_else(|| panic!("{} size overflow", what))
+}
+
 #[derive(Clone, Copy, Debug)]
 pub enum Op {
     Leaf,
@@ -80,6 +101,7 @@ pub struct Graph {
     /// use the O(log T)-depth scan instead of the sequential one
     pub scan_parallel: bool,
     watermark: usize,
+    sealed: bool,
 }
 
 impl Graph {
@@ -97,6 +119,7 @@ impl Graph {
             no_grad: false,
             scan_parallel: false,
             watermark: 0,
+            sealed: false,
         }
     }
 
@@ -105,6 +128,7 @@ impl Graph {
     }
 
     fn push(&mut self, shape: Vec<usize>, val: Vec<f32>, op: Op, req: bool) -> Nid {
+        assert_eq!(checked_numel(&shape), val.len(), "tensor shape does not match its value count");
         self.val.push(val);
         self.grad.push(Vec::new());
         self.shape.push(shape);
@@ -125,6 +149,9 @@ impl Graph {
 
     /// A trainable leaf. Gradient buffer is allocated once and never freed.
     pub fn param(&mut self, name: &str, shape: Vec<usize>, val: Vec<f32>, decay: bool) -> Nid {
+        assert!(!self.sealed, "cannot add parameters after Graph::seal_params");
+        assert!(!name.is_empty(), "parameter name cannot be empty");
+        assert!(self.params.iter().all(|parameter| parameter.name != name), "duplicate parameter name: {}", name);
         let n = val.len();
         let id = self.push(shape, val, Op::Leaf, true);
         self.req[id] = true; // parameters always require grad, even under no_grad
@@ -135,11 +162,15 @@ impl Graph {
 
     /// Freeze the current tape length: `reset()` returns here.
     pub fn seal_params(&mut self) {
+        assert!(!self.sealed, "Graph::seal_params may only be called once");
+        assert!(self.op.iter().all(|op| matches!(op, Op::Leaf)), "seal parameters before building an operation tape");
         self.watermark = self.val.len();
+        self.sealed = true;
     }
 
     /// Drop all activations, keep parameters + their gradients.
     pub fn reset(&mut self) {
+        assert!(self.sealed, "call Graph::seal_params before Graph::reset");
         let w = self.watermark;
         self.val.truncate(w);
         self.grad.truncate(w);
@@ -165,6 +196,7 @@ impl Graph {
     }
 
     pub fn scalar(&self, id: Nid) -> f32 {
+        assert_eq!(self.val[id].len(), 1, "requested node is not a scalar");
         self.val[id][0]
     }
 
@@ -177,6 +209,7 @@ impl Graph {
     pub fn add(&mut self, a: Nid, b: Nid) -> Nid {
         let n = self.val[a].len();
         assert_eq!(n, self.val[b].len(), "add: shape mismatch");
+        assert_eq!(self.shape[a], self.shape[b], "add: shape mismatch");
         let mut out = vec![0.0f32; n];
         for i in 0..n {
             out[i] = self.val[a][i] + self.val[b][i];
@@ -189,6 +222,7 @@ impl Graph {
     pub fn sub(&mut self, a: Nid, b: Nid) -> Nid {
         let n = self.val[a].len();
         assert_eq!(n, self.val[b].len(), "sub: shape mismatch");
+        assert_eq!(self.shape[a], self.shape[b], "sub: shape mismatch");
         let mut out = vec![0.0f32; n];
         for i in 0..n {
             out[i] = self.val[a][i] - self.val[b][i];
@@ -201,6 +235,7 @@ impl Graph {
     pub fn mul(&mut self, a: Nid, b: Nid) -> Nid {
         let n = self.val[a].len();
         assert_eq!(n, self.val[b].len(), "mul: shape mismatch");
+        assert_eq!(self.shape[a], self.shape[b], "mul: shape mismatch");
         let mut out = vec![0.0f32; n];
         for i in 0..n {
             out[i] = self.val[a][i] * self.val[b][i];
@@ -237,6 +272,8 @@ impl Graph {
         let d = self.val[bias].len();
         let n = self.val[x].len();
         assert!(d > 0 && n % d == 0, "add_row: bad shapes");
+        assert_eq!(self.shape[bias], vec![d], "add_row: bias must be one-dimensional");
+        assert_eq!(self.shape[x].last().copied(), Some(d), "add_row: trailing dimension mismatch");
         let rows = n / d;
         let mut out = vec![0.0f32; n];
         for i in 0..rows {
@@ -253,6 +290,8 @@ impl Graph {
         let d = self.val[gain].len();
         let n = self.val[x].len();
         assert!(d > 0 && n % d == 0, "mul_row: bad shapes");
+        assert_eq!(self.shape[gain], vec![d], "mul_row: gain must be one-dimensional");
+        assert_eq!(self.shape[x].last().copied(), Some(d), "mul_row: trailing dimension mismatch");
         let rows = n / d;
         let mut out = vec![0.0f32; n];
         for i in 0..rows {
@@ -266,7 +305,7 @@ impl Graph {
     }
 
     pub fn matmul_nn(&mut self, a: Nid, b: Nid, m: usize, k: usize, n: usize) -> Nid {
-        let mut out = vec![0.0f32; m * n];
+        let mut out = vec![0.0f32; checked_2(m, n, "matrix product")];
         gemm_nn(&self.val[a], &self.val[b], &mut out, m, k, n, self.threads);
         let req = self.req[a] || self.req[b];
         self.push(vec![m, n], out, Op::MatMulNN(a, b, m, k, n), req)
@@ -274,7 +313,7 @@ impl Graph {
 
     /// x[m,k] @ w[n,k]^T -> [m,n]. Weights are stored [out,in].
     pub fn matmul_nt(&mut self, x: Nid, w: Nid, m: usize, k: usize, n: usize) -> Nid {
-        let mut out = vec![0.0f32; m * n];
+        let mut out = vec![0.0f32; checked_2(m, n, "matrix product")];
         gemm_nt(&self.val[x], &self.val[w], &mut out, m, k, n, self.threads);
         let req = self.req[x] || self.req[w];
         self.push(vec![m, n], out, Op::MatMulNT(x, w, m, k, n), req)
@@ -330,7 +369,9 @@ impl Graph {
     /// Root-mean-square normalisation (no mean subtraction, no bias).
     /// aux stores the per-row scale 1/sqrt(mean(x^2)+eps).
     pub fn rms_norm(&mut self, x: Nid, rows: usize, d: usize, eps: f32) -> Nid {
-        let n = rows * d;
+        assert!(d > 0, "rms_norm: width must be positive");
+        assert!(eps.is_finite() && eps > 0.0, "rms_norm: epsilon must be finite and positive");
+        let n = checked_2(rows, d, "RMSNorm");
         assert_eq!(self.val[x].len(), n, "rms_norm: bad shape");
         let mut out = vec![0.0f32; n];
         let mut scale = vec![0.0f32; rows];
@@ -357,8 +398,11 @@ impl Graph {
     /// Column slice: out[i, 0..len] = x[i, off..off+len]. Used to split fused
     /// projections into value / gate / decay streams for free.
     pub fn slice_cols(&mut self, x: Nid, rows: usize, dtot: usize, off: usize, len: usize) -> Nid {
-        assert!(off + len <= dtot, "slice_cols: out of range");
-        let mut out = vec![0.0f32; rows * len];
+        let end = off.checked_add(len).expect("slice_cols: range overflow");
+        assert!(end <= dtot, "slice_cols: out of range");
+        assert_eq!(self.val[x].len(), checked_2(rows, dtot, "column slice input"), "slice_cols: bad input shape");
+        let out_len = checked_2(rows, len, "column slice output");
+        let mut out = vec![0.0f32; out_len];
         for i in 0..rows {
             for j in 0..len {
                 out[i * len + j] = self.val[x][i * dtot + off + j];
@@ -369,9 +413,11 @@ impl Graph {
     }
 
     pub fn embed(&mut self, table: Nid, d: usize, ids: &[u32]) -> Nid {
+        assert!(d > 0, "embed: width must be positive");
+        assert_eq!(self.val[table].len() % d, 0, "embed: table shape mismatch");
         let rows = ids.len();
         let vocab = self.val[table].len() / d;
-        let mut out = vec![0.0f32; rows * d];
+        let mut out = vec![0.0f32; checked_2(rows, d, "embedding output")];
         for i in 0..rows {
             let t = ids[i] as usize;
             assert!(t < vocab, "embed: token out of range");
@@ -387,7 +433,8 @@ impl Graph {
 
     /// h_t = a_t * h_{t-1} + b_t over [batch, t, d].
     pub fn scan(&mut self, a: Nid, b: Nid, batch: usize, t: usize, d: usize) -> Nid {
-        let n = batch * t * d;
+        let n = checked_3(batch, t, d, "scan");
+        let rows = checked_2(batch, t, "scan rows");
         assert_eq!(self.val[a].len(), n, "scan: bad a");
         assert_eq!(self.val[b].len(), n, "scan: bad b");
         let mut h = vec![0.0f32; n];
@@ -397,16 +444,19 @@ impl Graph {
             scan_sequential(&self.val[a], &self.val[b], &mut h, batch, t, d, self.threads);
         }
         let req = self.req[a] || self.req[b];
-        self.push(vec![batch * t, d], h, Op::Scan(a, b, batch, t, d), req)
+        self.push(vec![rows, d], h, Op::Scan(a, b, batch, t, d), req)
     }
 
     /// Depthwise causal 1-D convolution: y[b,t,j] = bias[j] + sum_q w[q,j] x[b,t-q,j].
     /// Provides the short-range mixing the recurrence does not need to spend
     /// state capacity on (left-padded, so it never looks into the future).
     pub fn dwconv(&mut self, x: Nid, w: Nid, bias: Nid, batch: usize, t: usize, d: usize, k: usize) -> Nid {
-        let n = batch * t * d;
+        assert!(d > 0, "dwconv: width must be positive");
+        assert!(k > 0, "dwconv: kernel width must be positive");
+        let n = checked_3(batch, t, d, "depthwise convolution");
+        let rows = checked_2(batch, t, "depthwise convolution rows");
         assert_eq!(self.val[x].len(), n, "dwconv: bad x");
-        assert_eq!(self.val[w].len(), k * d, "dwconv: bad w");
+        assert_eq!(self.val[w].len(), checked_2(k, d, "depthwise convolution weights"), "dwconv: bad w");
         assert_eq!(self.val[bias].len(), d, "dwconv: bad bias");
         let mut out = vec![0.0f32; n];
         for bi in 0..batch {
@@ -426,21 +476,24 @@ impl Graph {
             }
         }
         let req = self.req[x] || self.req[w] || self.req[bias];
-        self.push(vec![batch * t, d], out, Op::DwConv(x, w, bias, batch, t, d, k), req)
+        self.push(vec![rows, d], out, Op::DwConv(x, w, bias, batch, t, d, k), req)
     }
 
     /// Mean cross-entropy over rows. `u32::MAX` targets are ignored.
     /// aux stores softmax probabilities so backward is a single subtraction.
     pub fn softmax_ce(&mut self, logits: Nid, rows: usize, vocab: usize, targets: &[u32]) -> Nid {
-        assert_eq!(self.val[logits].len(), rows * vocab, "softmax_ce: bad logits");
+        assert!(vocab > 0, "softmax_ce: vocabulary must be positive");
+        let elements = checked_2(rows, vocab, "softmax cross-entropy");
+        assert_eq!(self.val[logits].len(), elements, "softmax_ce: bad logits");
         assert_eq!(targets.len(), rows, "softmax_ce: bad targets");
-        let mut probs = vec![0.0f32; rows * vocab];
+        let mut probs = vec![0.0f32; elements];
         let mut loss = 0.0f64;
         let mut cnt = 0usize;
         for i in 0..rows {
             let mut mx = f32::NEG_INFINITY;
             for j in 0..vocab {
                 let v = self.val[logits][i * vocab + j];
+                assert!(v.is_finite(), "softmax_ce: logits must be finite");
                 if v > mx {
                     mx = v;
                 }
@@ -477,18 +530,26 @@ impl Graph {
 
     /// Cross-entropy against a *distribution* target (planner policy head).
     pub fn soft_ce(&mut self, logits: Nid, rows: usize, k: usize, target: &[f32]) -> Nid {
-        assert_eq!(self.val[logits].len(), rows * k, "soft_ce: bad logits");
-        assert_eq!(target.len(), rows * k, "soft_ce: bad target");
-        let mut probs = vec![0.0f32; rows * k];
+        assert!(k > 0, "soft_ce: class count must be positive");
+        let elements = checked_2(rows, k, "distribution cross-entropy");
+        assert_eq!(self.val[logits].len(), elements, "soft_ce: bad logits");
+        assert_eq!(target.len(), elements, "soft_ce: bad target");
+        let mut probs = vec![0.0f32; elements];
         let mut loss = 0.0f64;
         for i in 0..rows {
             let mut mx = f32::NEG_INFINITY;
+            let mut target_sum = 0.0f32;
             for j in 0..k {
                 let v = self.val[logits][i * k + j];
+                let target_value = target[i * k + j];
+                assert!(v.is_finite(), "soft_ce: logits must be finite");
+                assert!(target_value.is_finite() && target_value >= 0.0, "soft_ce: target weights must be finite and non-negative");
+                target_sum += target_value;
                 if v > mx {
                     mx = v;
                 }
             }
+            assert!(target_sum > 0.0, "soft_ce: every target row must have positive mass");
             let mut s = 0.0f32;
             for j in 0..k {
                 let e = (self.val[logits][i * k + j] - mx).exp();
@@ -522,6 +583,8 @@ impl Graph {
         assert_eq!(n, target.len(), "mse: bad target");
         let mut loss = 0.0f64;
         for i in 0..n {
+            assert!(self.val[pred][i].is_finite(), "mse: predictions must be finite");
+            assert!(target[i].is_finite(), "mse: targets must be finite");
             let d = (self.val[pred][i] - target[i]) as f64;
             loss += d * d;
         }
@@ -544,6 +607,34 @@ impl Graph {
     }
 }
 
+#[cfg(test)]
+mod invariant_tests {
+    use super::*;
+
+    #[test]
+    #[should_panic(expected = "call Graph::seal_params")]
+    fn reset_requires_a_sealed_parameter_prefix() {
+        let mut graph = Graph::new(1);
+        let _ = graph.param("weight", vec![1], vec![0.0], true);
+        graph.reset();
+    }
+
+    #[test]
+    #[should_panic(expected = "cannot add parameters")]
+    fn parameters_cannot_be_added_after_sealing() {
+        let mut graph = Graph::new(1);
+        graph.seal_params();
+        let _ = graph.param("late", vec![1], vec![0.0], true);
+    }
+
+    #[test]
+    #[should_panic(expected = "tensor shape does not match")]
+    fn leaf_shape_must_match_value_count() {
+        let mut graph = Graph::new(1);
+        let _ = graph.input(vec![2, 2], vec![0.0; 3]);
+    }
+}
+
 // ================= reverse pass =================
 
 impl Graph {
@@ -557,6 +648,8 @@ impl Graph {
     /// for the duration of the arm, which lets us mutably borrow input
     /// gradients from the very same vector without any unsafe or cloning.
     pub fn backward(&mut self, loss: Nid) {
+        assert!(loss < self.val.len(), "backward: loss node is out of range");
+        assert_eq!(self.val[loss].len(), 1, "backward: loss node must be scalar");
         for i in 0..=loss {
             if self.req[i] {
                 let n = self.val[i].len();
@@ -705,7 +798,7 @@ impl Graph {
                     let go = std::mem::take(&mut self.grad[id]);
                     if self.req[a] {
                         // dA = dC @ B^T
-                        let mut t = vec![0.0f32; m * k];
+                        let mut t = vec![0.0f32; checked_2(m, k, "MatMulNN input gradient")];
                         gemm_nt(&go, &self.val[b], &mut t, m, n, k, self.threads);
                         let g = &mut self.grad[a];
                         for i in 0..t.len() {
@@ -714,7 +807,7 @@ impl Graph {
                     }
                     if self.req[b] {
                         // dB = A^T @ dC
-                        let mut t = vec![0.0f32; k * n];
+                        let mut t = vec![0.0f32; checked_2(k, n, "MatMulNN weight gradient")];
                         gemm_tn(&self.val[a], &go, &mut t, m, k, n, self.threads);
                         let g = &mut self.grad[b];
                         for i in 0..t.len() {
@@ -728,7 +821,7 @@ impl Graph {
                     let go = std::mem::take(&mut self.grad[id]);
                     if self.req[x] {
                         // dX = dY @ W
-                        let mut t = vec![0.0f32; m * k];
+                        let mut t = vec![0.0f32; checked_2(m, k, "MatMulNT input gradient")];
                         gemm_nn(&go, &self.val[w], &mut t, m, n, k, self.threads);
                         let g = &mut self.grad[x];
                         for i in 0..t.len() {
@@ -737,7 +830,7 @@ impl Graph {
                     }
                     if self.req[w] {
                         // dW = dY^T @ X
-                        let mut t = vec![0.0f32; n * k];
+                        let mut t = vec![0.0f32; checked_2(n, k, "MatMulNT weight gradient")];
                         gemm_tn(&go, &self.val[x], &mut t, m, n, k, self.threads);
                         let g = &mut self.grad[w];
                         for i in 0..t.len() {
@@ -854,7 +947,7 @@ impl Graph {
 
                 Op::Scan(a, b, batch, t, d) => {
                     let go = std::mem::take(&mut self.grad[id]);
-                    let n = batch * t * d;
+                    let n = checked_3(batch, t, d, "scan adjoint");
                     let mut c = vec![0.0f32; n];
                     scan_adjoint(&self.val[a], &go, &mut c, batch, t, d);
                     if self.req[b] {
@@ -919,7 +1012,7 @@ impl Graph {
                     }
                     if self.req[bias] {
                         let g = &mut self.grad[bias];
-                        let rows = batch * t;
+                        let rows = checked_2(batch, t, "depthwise convolution gradient rows");
                         for i in 0..rows {
                             for j in 0..d {
                                 g[j] += go[i * d + j];
@@ -1023,7 +1116,9 @@ impl Graph {
     /// Rescale gradients so the global norm is at most `max_norm`.
     /// Returns the pre-clip norm (a useful training-health signal).
     pub fn clip_grad_norm(&mut self, max_norm: f32) -> f32 {
+        assert!(max_norm.is_finite() && max_norm >= 0.0, "gradient clip norm must be finite and non-negative");
         let norm = self.grad_norm();
+        assert!(norm.is_finite(), "non-finite parameter gradient norm");
         if norm > max_norm && norm > 0.0 {
             let s = max_norm / norm;
             for p in 0..self.params.len() {
@@ -1039,7 +1134,9 @@ impl Graph {
     pub fn param_count(&self) -> usize {
         let mut n = 0usize;
         for p in 0..self.params.len() {
-            n += self.val[self.params[p].id].len();
+            n = n
+                .checked_add(self.val[self.params[p].id].len())
+                .expect("parameter count overflow");
         }
         n
     }

@@ -118,9 +118,8 @@ impl Puzzle {
 
     /// One-hot position x tile encoding: 9 positions * 9 tile ids.
     pub fn features(&self, out: &mut [f32]) {
-        for i in 0..FEAT {
-            out[i] = 0.0;
-        }
+        assert_eq!(out.len(), FEAT, "feature buffer has the wrong size");
+        out.fill(0.0);
         for p in 0..9 {
             out[p * 9 + (self.tiles[p] as usize)] = 1.0;
         }
@@ -190,6 +189,24 @@ pub struct PvNet {
     pub hidden: usize,
 }
 
+struct EvalScratch {
+    h1: Vec<f32>,
+    h2: Vec<f32>,
+    policy: [f32; N_ACT],
+    value: [f32; 1],
+}
+
+impl EvalScratch {
+    fn new(hidden: usize) -> EvalScratch {
+        EvalScratch {
+            h1: vec![0.0; hidden],
+            h2: vec![0.0; hidden],
+            policy: [0.0; N_ACT],
+            value: [0.0; 1],
+        }
+    }
+}
+
 impl PvNet {
     pub fn new(g: &mut Graph, rng: &mut Rng, hidden: usize) -> PvNet {
         let l1 = Linear::new(g, rng, "pv.l1", FEAT, hidden, true, init_std(FEAT));
@@ -199,46 +216,70 @@ impl PvNet {
         PvNet { l1, l2, ph, vh, hidden }
     }
 
-    /// Tape-free single-state evaluation. MCTS calls this thousands of times
-    /// per move, so it must not allocate graph nodes.
+    /// Tape-free single-state evaluation. The convenience path allocates one
+    /// scratch set; MCTS uses the reusable internal path below.
     pub fn eval_one(&self, g: &Graph, feat: &[f32]) -> ([f32; N_ACT], f32) {
+        let mut scratch = EvalScratch::new(self.hidden);
+        self.eval_one_with_scratch(g, feat, &mut scratch)
+    }
+
+    fn eval_one_with_scratch(&self, g: &Graph, feat: &[f32], scratch: &mut EvalScratch) -> ([f32; N_ACT], f32) {
+        assert_eq!(feat.len(), FEAT, "policy/value feature vector has the wrong width");
+        assert_eq!(scratch.h1.len(), self.hidden, "policy/value scratch has the wrong width");
+        assert_eq!(scratch.h2.len(), self.hidden, "policy/value scratch has the wrong width");
         let th = 1;
-        let mut h1 = vec![0.0f32; self.hidden];
         let b1 = match self.l1.b {
             Some(b) => Some(&g.val[b][..]),
             None => None,
         };
-        matvec_nt(&g.val[self.l1.w], b1, feat, &mut h1, self.hidden, FEAT, th);
+        matvec_nt(&g.val[self.l1.w], b1, feat, &mut scratch.h1, self.hidden, FEAT, th);
         for i in 0..self.hidden {
-            h1[i] = silu(h1[i]);
+            scratch.h1[i] = silu(scratch.h1[i]);
         }
-        let mut h2 = vec![0.0f32; self.hidden];
         let b2 = match self.l2.b {
             Some(b) => Some(&g.val[b][..]),
             None => None,
         };
-        matvec_nt(&g.val[self.l2.w], b2, &h1, &mut h2, self.hidden, self.hidden, th);
+        matvec_nt(
+            &g.val[self.l2.w],
+            b2,
+            &scratch.h1,
+            &mut scratch.h2,
+            self.hidden,
+            self.hidden,
+            th,
+        );
         for i in 0..self.hidden {
-            h2[i] = silu(h2[i]) + h1[i];
+            scratch.h2[i] = silu(scratch.h2[i]) + scratch.h1[i];
         }
-        let mut pl = vec![0.0f32; N_ACT];
         let bp = match self.ph.b {
             Some(b) => Some(&g.val[b][..]),
             None => None,
         };
-        matvec_nt(&g.val[self.ph.w], bp, &h2, &mut pl, N_ACT, self.hidden, th);
-        softmax_inplace(&mut pl);
-        let mut vv = vec![0.0f32; 1];
+        matvec_nt(
+            &g.val[self.ph.w],
+            bp,
+            &scratch.h2,
+            &mut scratch.policy,
+            N_ACT,
+            self.hidden,
+            th,
+        );
+        softmax_inplace(&mut scratch.policy);
         let bv = match self.vh.b {
             Some(b) => Some(&g.val[b][..]),
             None => None,
         };
-        matvec_nt(&g.val[self.vh.w], bv, &h2, &mut vv, 1, self.hidden, th);
-        let mut p = [0.0f32; N_ACT];
-        for a in 0..N_ACT {
-            p[a] = pl[a];
-        }
-        (p, vv[0].tanh())
+        matvec_nt(
+            &g.val[self.vh.w],
+            bv,
+            &scratch.h2,
+            &mut scratch.value,
+            1,
+            self.hidden,
+            th,
+        );
+        (scratch.policy, scratch.value[0].tanh())
     }
 
     /// Batched, differentiable version used for training.
@@ -291,10 +332,17 @@ impl Mcts {
         self.nodes.len()
     }
 
-    fn expand(&mut self, env: &Puzzle, net: &PvNet, g: &Graph, feat: &mut Vec<f32>) -> usize {
+    fn expand(
+        &mut self,
+        env: &Puzzle,
+        net: &PvNet,
+        g: &Graph,
+        feat: &mut [f32],
+        scratch: &mut EvalScratch,
+    ) -> usize {
         env.features(feat);
-        let (p, v) = net.eval_one(g, feat);
-        self.evals += 1;
+        let (p, v) = net.eval_one_with_scratch(g, feat, scratch);
+        self.evals = self.evals.checked_add(1).expect("MCTS evaluation counter overflow");
         let mut legal = [false; N_ACT];
         let mut sum = 0.0f32;
         let mut n_legal = 0usize;
@@ -339,10 +387,7 @@ impl Mcts {
     /// stops the search from being forced to try every branch once.
     fn select(&self, idx: usize) -> usize {
         let node = &self.nodes[idx];
-        let mut tot = 0.0f32;
-        for a in 0..N_ACT {
-            tot += node.n[a] as f32;
-        }
+        let tot = node.visits as f32;
         let sqrt_tot = if tot > 1.0 { tot.sqrt() } else { 1.0 };
         let mut best = usize::MAX;
         let mut best_score = f32::NEG_INFINITY;
@@ -364,35 +409,50 @@ impl Mcts {
 
     /// Returns the normalised root visit distribution - the search policy.
     pub fn run(&mut self, root: &Puzzle, sims: usize, net: &PvNet, g: &Graph, rng: &mut Rng, dir_alpha: f32) -> [f32; N_ACT] {
+        assert!(self.c_puct.is_finite() && self.c_puct >= 0.0, "MCTS exploration constant must be finite and non-negative");
+        assert!(self.gamma.is_finite() && self.gamma >= 0.0 && self.gamma <= 1.0, "MCTS discount must be in [0, 1]");
+        assert!(self.max_depth > 0, "MCTS maximum depth must be positive");
+        assert!(dir_alpha.is_finite() && dir_alpha >= 0.0, "Dirichlet alpha must be finite and non-negative");
+
         self.nodes.clear();
+        let desired_capacity = sims.saturating_add(1);
+        if desired_capacity > self.nodes.capacity() {
+            self.nodes.reserve(desired_capacity - self.nodes.capacity());
+        }
         let mut feat = vec![0.0f32; FEAT];
-        let r = self.expand(root, net, g, &mut feat);
+        let mut eval_scratch = EvalScratch::new(net.hidden);
+        let r = self.expand(root, net, g, &mut feat, &mut eval_scratch);
 
         // Dirichlet exploration noise at the root: keeps self-play from
         // collapsing onto whatever the current net already prefers.
         if dir_alpha > 0.0 {
             let noise = rng.dirichlet(dir_alpha, N_ACT);
             let eps = 0.25f32;
-            let mut s = 0.0f32;
+            let mut sum = 0.0f32;
             for a in 0..N_ACT {
                 if self.nodes[r].legal[a] {
                     let mixed = (1.0 - eps) * self.nodes[r].prior[a] + eps * noise[a];
                     self.nodes[r].prior[a] = mixed;
-                    s += mixed;
+                    sum += mixed;
                 }
             }
-            if s > 1e-9 {
+            if sum > 1e-9 {
                 for a in 0..N_ACT {
-                    self.nodes[r].prior[a] /= s;
+                    self.nodes[r].prior[a] /= sum;
                 }
             }
         }
 
+        let path_capacity = self.max_depth.min(4096);
+        let mut path: Vec<(usize, usize, f32)> = Vec::with_capacity(path_capacity);
+        let mut seen_keys: Vec<u64> = Vec::with_capacity(path_capacity.saturating_add(1));
         for _ in 0..sims {
             let mut env = *root;
             let mut cur = r;
-            let mut path: Vec<(usize, usize, f32)> = Vec::new();
-            let mut leaf = 0.0f32;
+            path.clear();
+            seen_keys.clear();
+            seen_keys.push(self.nodes[r].key);
+            let leaf;
             let mut depth = 0usize;
             loop {
                 if self.nodes[cur].terminal {
@@ -403,54 +463,67 @@ impl Mcts {
                     leaf = self.nodes[cur].value;
                     break;
                 }
-                let a = self.select(cur);
-                if a == usize::MAX {
+                let action = self.select(cur);
+                if action == usize::MAX {
                     leaf = self.nodes[cur].value;
                     break;
                 }
-                let rew = env.step(a);
+                let reward = env.step(action);
                 depth += 1;
-                let c = self.nodes[cur].child[a];
-                if c < 0 {
-                    let ni = self.expand(&env, net, g, &mut feat);
-                    self.nodes[cur].child[a] = ni as i32;
-                    path.push((cur, a, rew));
-                    leaf = if self.nodes[ni].terminal { 0.0 } else { self.nodes[ni].value };
+                path.push((cur, action, reward));
+
+                // Sliding-puzzle moves can revisit an ancestor. Treat that
+                // loop as a neutral leaf; the accumulated step cost then makes
+                // it less attractive without expanding duplicate cycle nodes.
+                let next_key = env.key();
+                if seen_keys.contains(&next_key) {
+                    leaf = 0.0;
                     break;
                 }
-                path.push((cur, a, rew));
-                cur = c as usize;
+                seen_keys.push(next_key);
+
+                let child = self.nodes[cur].child[action];
+                if child < 0 {
+                    let next = self.expand(&env, net, g, &mut feat, &mut eval_scratch);
+                    assert!(next <= i32::MAX as usize, "MCTS arena exceeds the child-index limit");
+                    self.nodes[cur].child[action] = next as i32;
+                    leaf = if self.nodes[next].terminal { 0.0 } else { self.nodes[next].value };
+                    break;
+                }
+                let next = child as usize;
+                assert_eq!(self.nodes[next].key, next_key, "MCTS child state does not match the environment");
+                cur = next;
             }
-            // discounted backup along the traversed path
-            let mut v = leaf;
+
+            // Discounted backup along the traversed path.
+            let mut value = leaf;
             let mut i = path.len();
             while i > 0 {
                 i -= 1;
-                let nd = path[i].0;
-                let a = path[i].1;
-                let rew = path[i].2;
-                v = rew + self.gamma * v;
-                self.nodes[nd].w[a] += v;
-                self.nodes[nd].n[a] += 1;
-                self.nodes[nd].visits += 1;
+                let node = path[i].0;
+                let action = path[i].1;
+                let reward = path[i].2;
+                value = reward + self.gamma * value;
+                self.nodes[node].w[action] += value;
+                self.nodes[node].n[action] = self.nodes[node].n[action]
+                    .checked_add(1)
+                    .expect("MCTS edge visit count overflow");
+                self.nodes[node].visits = self.nodes[node]
+                    .visits
+                    .checked_add(1)
+                    .expect("MCTS node visit count overflow");
             }
         }
 
         let mut out = [0.0f32; N_ACT];
-        let mut tot = 0.0f32;
-        for a in 0..N_ACT {
-            tot += self.nodes[r].n[a] as f32;
-        }
-        if tot > 0.0 {
+        let total = self.nodes[r].visits as f32;
+        if total > 0.0 {
             for a in 0..N_ACT {
-                out[a] = (self.nodes[r].n[a] as f32) / tot;
+                out[a] = (self.nodes[r].n[a] as f32) / total;
             }
         } else {
-            for a in 0..N_ACT {
-                out[a] = self.nodes[r].prior[a];
-            }
+            out = self.nodes[r].prior;
         }
-        let _ = self.nodes[r].key;
         out
     }
 
@@ -522,6 +595,8 @@ pub fn selfplay_iteration(
     max_steps: usize,
     temp_moves: usize,
 ) -> TrainStats {
+    assert!(batch > 0, "self-play training batch must be positive");
+    assert!(lr.is_finite() && lr >= 0.0, "self-play learning rate must be finite and non-negative");
     let gamma = 0.99f32;
     let mut feats: Vec<f32> = Vec::new();
     let mut pols: Vec<f32> = Vec::new();
@@ -539,16 +614,16 @@ pub fn selfplay_iteration(
         let mut rewards: Vec<f32> = Vec::new();
         let mut solved = false;
         for step in 0..max_steps {
+            if env.is_solved() {
+                solved = true;
+                break;
+            }
             let pi = mcts.run(&env, sims, net, g, rng, 0.6);
             env.features(&mut feat);
             g_feats.extend_from_slice(&feat);
             g_pols.extend_from_slice(&pi);
             let a = if step < temp_moves {
-                let mut w = vec![0.0f32; N_ACT];
-                for i in 0..N_ACT {
-                    w[i] = pi[i];
-                }
-                rng.categorical(&w)
+                rng.categorical(&pi)
             } else {
                 let mut best = 0usize;
                 for i in 1..N_ACT {
@@ -592,18 +667,19 @@ pub fn selfplay_iteration(
 
     // ---- supervised fit on the freshly generated targets ----
     let rows_total = vals.len();
-    let mut loss_sum = 0.0f32;
-    let mut nb = 0usize;
-    if rows_total >= batch {
+    let mut weighted_loss = 0.0f64;
+    let mut trained_rows = 0usize;
+    if rows_total > 0 {
         let mut idx: Vec<usize> = (0..rows_total).collect();
         rng.shuffle_usize(&mut idx);
         let mut off = 0usize;
-        while off + batch <= rows_total {
+        while off < rows_total {
+            let rows = batch.min(rows_total - off);
             g.reset();
-            let mut xb = vec![0.0f32; batch * FEAT];
-            let mut pb = vec![0.0f32; batch * N_ACT];
-            let mut vb = vec![0.0f32; batch];
-            for b in 0..batch {
+            let mut xb = vec![0.0f32; rows.checked_mul(FEAT).expect("feature minibatch size overflow")];
+            let mut pb = vec![0.0f32; rows.checked_mul(N_ACT).expect("policy minibatch size overflow")];
+            let mut vb = vec![0.0f32; rows];
+            for b in 0..rows {
                 let s = idx[off + b];
                 for j in 0..FEAT {
                     xb[b * FEAT + j] = feats[s * FEAT + j];
@@ -613,24 +689,24 @@ pub fn selfplay_iteration(
                 }
                 vb[b] = vals[s];
             }
-            let x = g.input(vec![batch, FEAT], xb);
-            let (logits, v) = net.heads(g, x, batch);
-            let lp = g.soft_ce(logits, batch, N_ACT, &pb);
+            let x = g.input(vec![rows, FEAT], xb);
+            let (logits, v) = net.heads(g, x, rows);
+            let lp = g.soft_ce(logits, rows, N_ACT, &pb);
             let lv = g.mse(v, &vb);
             let loss = g.add(lp, lv);
             g.zero_grad();
             g.backward(loss);
             g.clip_grad_norm(1.0);
             opt.step(g, lr);
-            loss_sum += g.scalar(loss);
-            off += batch;
-            nb += 1;
+            weighted_loss += (g.scalar(loss) as f64) * (rows as f64);
+            off += rows;
+            trained_rows += rows;
         }
         g.reset();
     }
 
     TrainStats {
-        loss: if nb > 0 { loss_sum / (nb as f32) } else { 0.0 },
+        loss: if trained_rows > 0 { (weighted_loss / (trained_rows as f64)) as f32 } else { 0.0 },
         solve_rate: if games > 0 { (solved_n as f32) / (games as f32) } else { 0.0 },
         avg_len: if games > 0 { (len_sum as f32) / (games as f32) } else { 0.0 },
         samples: rows_total,
