@@ -28,10 +28,12 @@ jobs:
           toolchain: ${{ matrix.toolchain }}
       - name: Check
         run: |
-          cargo check --all-targets || {
-            echo "::error::Cargo check failed"
+          if ! output=$(cargo check --all-targets 2>&1); then
+            echo "$output" | head -n 30 | while IFS= read -r line; do
+              echo "::error::$line"
+            done
             exit 1
-          }
+          fi
       - name: Test
         run: cargo test --all-targets
 
