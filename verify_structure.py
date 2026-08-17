@@ -4,18 +4,22 @@
 Substitutes for the compiler's cheapest checks:
 
   1. delimiter balance per file (comment / string / char-literal aware)
-  2. `mod x;` declarations resolve to src/x.rs, and every src file is declared
+  2. `mod x;` declarations resolve to x.rs, and every Rust file is declared
   3. `use crate::m::{a, b}` symbols exist as pub items in module m
-  4. every `g.method(` call on a Graph exists in autograd.rs
+  4. every `g.method(…)` call on a Graph exists in autograd.rs
   5. format-string placeholder count matches argument count for
      println!/print!/format!/panic!/writeln!/write!/eprintln!
 
-Run:  python3 tools/verify_structure.py
+Run from any directory:  python3 verify_structure.py
 """
-import os, re, sys
+import os
+import re
+import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-SRC = os.path.join(os.path.dirname(HERE), "src")
+REPO = HERE if os.path.isfile(os.path.join(HERE, "Cargo.toml")) else os.path.dirname(HERE)
+STANDARD_SRC = os.path.join(REPO, "src")
+SRC = STANDARD_SRC if os.path.isfile(os.path.join(STANDARD_SRC, "main.rs")) else REPO
 files = sorted(f for f in os.listdir(SRC) if f.endswith(".rs"))
 problems = []
 
@@ -77,6 +81,10 @@ def strip_code(text):
     return "".join(out)
 
 
+if "main.rs" not in files:
+    print(f"main.rs not found under {SRC}")
+    sys.exit(1)
+
 code = {}
 for f in files:
     raw = open(os.path.join(SRC, f), encoding="utf-8").read()
@@ -113,12 +121,12 @@ main_raw, main_code = code["main.rs"]
 mods = re.findall(r"^\s*mod\s+([a-z_0-9]+)\s*;", main_code, re.M)
 for m in mods:
     if m + ".rs" not in files:
-        problems.append(f"main.rs: mod {m}; has no src/{m}.rs")
+        problems.append(f"main.rs: mod {m}; has no {m}.rs")
 for f in files:
     if f == "main.rs":
         continue
     if f[:-3] not in mods:
-        problems.append(f"src/{f} is never declared with `mod {f[:-3]};` in main.rs")
+        problems.append(f"{f} is never declared with `mod {f[:-3]};` in main.rs")
 
 # ---- 3. pub item inventory + use checking --------------------------------
 pub_items = {}
@@ -277,6 +285,7 @@ for f in files:
             )
 
 # ---- report --------------------------------------------------------------
+print("source directory:", SRC)
 print("files checked:", len(files), "->", ", ".join(files))
 print("total lines:", sum(code[f][0].count("\n") + 1 for f in files))
 print("modules:", ", ".join(sorted(pub_items)))

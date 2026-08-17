@@ -1,0 +1,8 @@
+/target/
+*.ckpt
+*.tok
+*.tmp
+*.log
+.DS_Store
+.idea/
+.vscode/

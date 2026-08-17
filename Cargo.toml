@@ -5,6 +5,15 @@ edition = "2021"
 rust-version = "1.70"
 description = "Noetic: a zero-dependency cognitive engine in pure Rust. Autodiff, gated linear-recurrence sequence model (no attention, no transformer), BPE, planner, associative memory."
 license = "MIT"
+readme = "README.md"
+repository = "https://github.com/SHOOP111/noetic"
+keywords = ["machine-learning", "autodiff", "state-space-model", "bpe", "mcts"]
+categories = ["algorithms", "science"]
+
+# The source files intentionally live at the repository root.
+[[bin]]
+name = "noetic"
+path = "main.rs"
 
 # ------------------------------------------------------------------
 # The whole point: this section is empty and must stay empty.
@@ -19,6 +28,7 @@ lto = "fat"
 codegen-units = 1
 panic = "abort"
 debug = false
+strip = "symbols"
 
 [profile.release.package."*"]
 opt-level = 3
