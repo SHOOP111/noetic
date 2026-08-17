@@ -20,23 +20,37 @@
 //! Layout everywhere: index(b, t, j) = (b * T + t) * D + j, so the innermost
 //! axis is contiguous and the per-timestep update is a straight vector op.
 
+use crate::tensor::worker_count;
+
+#[inline]
+fn scan_len(batch: usize, t: usize, d: usize) -> usize {
+    batch
+        .checked_mul(t)
+        .and_then(|value| value.checked_mul(d))
+        .expect("scan dimensions overflow")
+}
+
 /// Inclusive scan, sequential in time, parallel over the batch axis.
 pub fn scan_sequential(a: &[f32], b: &[f32], h: &mut [f32], batch: usize, t: usize, d: usize, threads: usize) {
-    let n = batch * t * d;
+    let n = scan_len(batch, t, d);
     assert_eq!(a.len(), n, "scan: bad a");
     assert_eq!(b.len(), n, "scan: bad b");
     assert_eq!(h.len(), n, "scan: bad h");
     if n == 0 {
         return;
     }
-    let nt = threads.max(1).min(batch);
+    let nt = worker_count(threads, batch, n);
     if nt == 1 {
         kern_scan_seq(a, b, h, 0, batch, t, d);
         return;
     }
-    let per = (batch + nt - 1) / nt;
+    let per = 1 + (batch - 1) / nt;
+    let chunk_len = per
+        .checked_mul(t)
+        .and_then(|value| value.checked_mul(d))
+        .expect("scan chunk dimensions overflow");
     std::thread::scope(|s| {
-        for (ci, chunk) in h.chunks_mut(per * t * d).enumerate() {
+        for (ci, chunk) in h.chunks_mut(chunk_len).enumerate() {
             let b0 = ci * per;
             let cnt = chunk.len() / (t * d);
             s.spawn(move || kern_scan_seq(a, b, chunk, b0, cnt, t, d));
@@ -67,14 +81,14 @@ fn kern_scan_seq(a: &[f32], b: &[f32], h: &mut [f32], b0: usize, batch: usize, t
 /// Inclusive scan with O(log T) depth (Hillis-Steele, double buffered).
 /// Threaded across the time axis; batch elements are processed in order.
 pub fn scan_log_depth(a: &[f32], b: &[f32], h: &mut [f32], batch: usize, t: usize, d: usize, threads: usize) {
-    let n = batch * t * d;
+    let n = scan_len(batch, t, d);
     assert_eq!(a.len(), n, "scan: bad a");
     assert_eq!(b.len(), n, "scan: bad b");
     assert_eq!(h.len(), n, "scan: bad h");
     if n == 0 {
         return;
     }
-    let span = t * d;
+    let span = t.checked_mul(d).expect("scan span overflow");
     let mut sa = vec![0.0f32; span];
     let mut sb = vec![0.0f32; span];
     let mut da = vec![0.0f32; span];
@@ -88,11 +102,12 @@ pub fn scan_log_depth(a: &[f32], b: &[f32], h: &mut [f32], batch: usize, t: usiz
             {
                 let ra: &[f32] = &sa;
                 let rb: &[f32] = &sb;
-                let nt = threads.max(1).min(t);
-                let per = ((t + nt - 1) / nt).max(1);
+                let nt = worker_count(threads, t, span);
+                let per = 1 + (t - 1) / nt;
+                let chunk_len = per.checked_mul(d).expect("scan time chunk overflow");
                 std::thread::scope(|s| {
-                    let ia = da.chunks_mut(per * d);
-                    let ib = db.chunks_mut(per * d);
+                    let ia = da.chunks_mut(chunk_len);
+                    let ib = db.chunks_mut(chunk_len);
                     for (ci, (xa, xb)) in ia.zip(ib).enumerate() {
                         let t0 = ci * per;
                         let cnt = xa.len() / d;
@@ -119,7 +134,7 @@ pub fn scan_log_depth(a: &[f32], b: &[f32], h: &mut [f32], batch: usize, t: usiz
             }
             std::mem::swap(&mut sa, &mut da);
             std::mem::swap(&mut sb, &mut db);
-            stride <<= 1;
+            stride = stride.saturating_mul(2);
         }
         h[base..base + span].copy_from_slice(&sb);
     }
@@ -134,6 +149,13 @@ pub fn scan_log_depth(a: &[f32], b: &[f32], h: &mut [f32], batch: usize, t: usiz
 ///
 /// `c` is filled with the adjoint stream; callers scatter it into a/b grads.
 pub fn scan_adjoint(a: &[f32], g: &[f32], c: &mut [f32], batch: usize, t: usize, d: usize) {
+    let n = scan_len(batch, t, d);
+    assert_eq!(a.len(), n, "scan adjoint: bad a");
+    assert_eq!(g.len(), n, "scan adjoint: bad output gradient");
+    assert_eq!(c.len(), n, "scan adjoint: bad destination");
+    if n == 0 {
+        return;
+    }
     let mut carry = vec![0.0f32; d];
     for bi in 0..batch {
         let base = bi * t * d;

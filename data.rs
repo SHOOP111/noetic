@@ -101,7 +101,7 @@ impl Batcher {
         } else {
             0.05
         };
-        let mut split = ((n as f32) * (1.0 - val_frac)) as usize;
+        let mut split = ((n as f64) * (1.0 - val_frac as f64)) as usize;
         split = split.clamp(2, n);
         if val_frac > 0.0 && n >= 4 {
             split = split.min(n - 2);
@@ -122,8 +122,9 @@ impl Batcher {
         // A crop consumes t + 1 tokens. If the range contains `available`
         // tokens, there are exactly `available - t` valid starting offsets.
         let starts = available - t;
-        let mut x = vec![0u32; batch * t];
-        let mut y = vec![0u32; batch * t];
+        let elements = batch.checked_mul(t).expect("batch dimensions overflow");
+        let mut x = vec![0u32; elements];
+        let mut y = vec![0u32; elements];
         for b in 0..batch {
             let s = lo + rng.below(starts);
             for i in 0..t {

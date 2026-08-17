@@ -18,6 +18,7 @@ pub struct AdamW {
 
 impl AdamW {
     pub fn new(g: &Graph, wd: f32) -> AdamW {
+        assert!(wd.is_finite() && wd >= 0.0, "AdamW weight decay must be finite and non-negative");
         let mut m = Vec::with_capacity(g.params.len());
         let mut v = Vec::with_capacity(g.params.len());
         for p in 0..g.params.len() {
@@ -29,7 +30,14 @@ impl AdamW {
     }
 
     pub fn step(&mut self, g: &mut Graph, lr: f32) {
-        self.t += 1;
+        assert!(lr.is_finite() && lr >= 0.0, "AdamW learning rate must be finite and non-negative");
+        assert!(self.b1.is_finite() && self.b1 >= 0.0 && self.b1 < 1.0, "AdamW beta1 must be in [0, 1)");
+        assert!(self.b2.is_finite() && self.b2 >= 0.0 && self.b2 < 1.0, "AdamW beta2 must be in [0, 1)");
+        assert!(self.eps.is_finite() && self.eps > 0.0, "AdamW epsilon must be finite and positive");
+        assert!(self.wd.is_finite() && self.wd >= 0.0, "AdamW weight decay must be finite and non-negative");
+        assert_eq!(self.m.len(), g.params.len(), "AdamW parameter set changed after construction");
+        assert_eq!(self.v.len(), g.params.len(), "AdamW parameter set changed after construction");
+        self.t = self.t.checked_add(1).expect("AdamW step counter overflow");
         let tf = self.t as f32;
         let bc1 = 1.0 - self.b1.powf(tf);
         let bc2 = 1.0 - self.b2.powf(tf);
@@ -39,8 +47,12 @@ impl AdamW {
             let id = g.params[p].id;
             let decay = g.params[p].decay;
             let n = g.val[id].len();
+            assert_eq!(self.m[p].len(), n, "AdamW first-moment shape mismatch");
+            assert_eq!(self.v[p].len(), n, "AdamW second-moment shape mismatch");
             for i in 0..n {
                 let gr = g.grad[id][i];
+                assert!(gr.is_finite(), "AdamW received a non-finite gradient");
+                assert!(g.val[id][i].is_finite(), "AdamW received a non-finite parameter");
                 let mi = self.b1 * self.m[p][i] + (1.0 - self.b1) * gr;
                 let vi = self.b2 * self.v[p][i] + (1.0 - self.b2) * gr * gr;
                 self.m[p][i] = mi;
@@ -69,6 +81,7 @@ pub struct Lion {
 
 impl Lion {
     pub fn new(g: &Graph, wd: f32) -> Lion {
+        assert!(wd.is_finite() && wd >= 0.0, "Lion weight decay must be finite and non-negative");
         let mut m = Vec::with_capacity(g.params.len());
         for p in 0..g.params.len() {
             let n = g.val[g.params[p].id].len();
@@ -78,12 +91,20 @@ impl Lion {
     }
 
     pub fn step(&mut self, g: &mut Graph, lr: f32) {
+        assert!(lr.is_finite() && lr >= 0.0, "Lion learning rate must be finite and non-negative");
+        assert!(self.b1.is_finite() && self.b1 >= 0.0 && self.b1 < 1.0, "Lion beta1 must be in [0, 1)");
+        assert!(self.b2.is_finite() && self.b2 >= 0.0 && self.b2 < 1.0, "Lion beta2 must be in [0, 1)");
+        assert!(self.wd.is_finite() && self.wd >= 0.0, "Lion weight decay must be finite and non-negative");
+        assert_eq!(self.m.len(), g.params.len(), "Lion parameter set changed after construction");
         for p in 0..g.params.len() {
             let id = g.params[p].id;
             let decay = g.params[p].decay;
             let n = g.val[id].len();
+            assert_eq!(self.m[p].len(), n, "Lion momentum shape mismatch");
             for i in 0..n {
                 let gr = g.grad[id][i];
+                assert!(gr.is_finite(), "Lion received a non-finite gradient");
+                assert!(g.val[id][i].is_finite(), "Lion received a non-finite parameter");
                 let c = self.b1 * self.m[p][i] + (1.0 - self.b1) * gr;
                 let s = if c > 0.0 {
                     1.0f32
@@ -114,6 +135,9 @@ pub struct Schedule {
 
 impl Schedule {
     pub fn lr(&self, step: usize) -> f32 {
+        assert!(self.peak.is_finite() && self.peak >= 0.0, "schedule peak learning rate must be finite and non-negative");
+        assert!(self.min.is_finite() && self.min >= 0.0, "schedule minimum learning rate must be finite and non-negative");
+        assert!(self.total > 0, "schedule total step count must be positive");
         if self.warmup > 0 && step < self.warmup {
             return self.peak * ((step + 1) as f32) / (self.warmup as f32);
         }
