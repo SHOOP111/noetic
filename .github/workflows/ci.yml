@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main, "ai/**"]
+    branches: [main]
   pull_request:
   workflow_dispatch:
 
@@ -14,8 +14,8 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  rust:
-    name: Rust ${{ matrix.toolchain }}
+  build:
+    name: Build and test (Rust ${{ matrix.toolchain }})
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -30,12 +30,21 @@ jobs:
         run: cargo check --all-targets
       - name: Test
         run: cargo test --all-targets
-      - name: Self-test
-        if: matrix.toolchain == 'stable'
-        run: cargo run --release -- selftest --threads 2
-      - name: Verify independent math
-        if: matrix.toolchain == 'stable'
+
+  selftest:
+    name: Engine self-test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo run --release -- selftest --threads 2
+
+  verify:
+    name: Independent verifiers
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify math
         run: python3 verify_math.py
       - name: Verify source structure
-        if: matrix.toolchain == 'stable'
         run: python3 verify_structure.py
