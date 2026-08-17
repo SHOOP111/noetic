@@ -26,7 +26,7 @@ const KEYS: [&str; 8] = ["alpha", "beta", "gamma", "delta", "omega", "sigma", "t
 
 pub fn synthetic_corpus(target_bytes: usize, seed: u64) -> String {
     let mut rng = Rng::new(seed);
-    let mut s = String::with_capacity(target_bytes + 256);
+    let mut s = String::with_capacity(target_bytes.saturating_add(256));
     while s.len() < target_bytes {
         let kind = rng.below(4);
         if kind == 0 {
@@ -95,23 +95,40 @@ pub struct Batcher {
 impl Batcher {
     pub fn new(tokens: Vec<u32>, val_frac: f32) -> Batcher {
         let n = tokens.len();
+        assert!(n >= 2, "Batcher requires at least two tokens");
+        let val_frac = if val_frac.is_finite() {
+            val_frac.clamp(0.0, 0.5)
+        } else {
+            0.05
+        };
         let mut split = ((n as f32) * (1.0 - val_frac)) as usize;
-        if split < 2 {
-            split = n;
+        split = split.clamp(2, n);
+        if val_frac > 0.0 && n >= 4 {
+            split = split.min(n - 2);
         }
         Batcher { tokens, split }
     }
 
     fn crop(&self, lo: usize, hi: usize, batch: usize, t: usize, rng: &mut Rng) -> (Vec<u32>, Vec<u32>) {
+        assert!(batch > 0, "batch size must be positive");
+        assert!(t > 0, "context length must be positive");
+        assert!(lo <= hi && hi <= self.tokens.len(), "batch range is out of bounds");
+        let available = hi - lo;
+        assert!(
+            available > t,
+            "batch range must contain at least context length + 1 tokens"
+        );
+
+        // A crop consumes t + 1 tokens. If the range contains `available`
+        // tokens, there are exactly `available - t` valid starting offsets.
+        let starts = available - t;
         let mut x = vec![0u32; batch * t];
         let mut y = vec![0u32; batch * t];
-        let span = if hi > lo + t + 1 { hi - lo - t - 1 } else { 1 };
         for b in 0..batch {
-            let s = lo + rng.below(span);
+            let s = lo + rng.below(starts);
             for i in 0..t {
-                let p = s + i;
-                x[b * t + i] = self.tokens[p.min(self.tokens.len() - 2)];
-                y[b * t + i] = self.tokens[(p + 1).min(self.tokens.len() - 1)];
+                x[b * t + i] = self.tokens[s + i];
+                y[b * t + i] = self.tokens[s + i + 1];
             }
         }
         (x, y)
@@ -122,7 +139,7 @@ impl Batcher {
     }
 
     pub fn val_batch(&self, batch: usize, t: usize, rng: &mut Rng) -> (Vec<u32>, Vec<u32>) {
-        if self.split + t + 2 >= self.tokens.len() {
+        if self.tokens.len().saturating_sub(self.split) <= t {
             return self.crop(0, self.split, batch, t, rng);
         }
         self.crop(self.split, self.tokens.len(), batch, t, rng)

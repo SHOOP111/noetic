@@ -2,10 +2,8 @@
 //!
 //! * `splitmix64`    - seed expansion
 //! * `xoshiro256++`  - core stream, period 2^256 - 1
-//! * Marsaglia polar - gaussians (with cached spare)
+//! * Marsaglia polar - gaussians (with a cached spare)
 //! * Marsaglia-Tsang - gamma variates -> Dirichlet (used by the planner)
-//!
-//! Bit-identical on every platform, which is what makes `selftest` reproducible.
 
 /// SplitMix64: expands one u64 seed into the 256-bit xoshiro state.
 pub fn splitmix64(state: &mut u64) -> u64 {
@@ -78,20 +76,23 @@ impl Rng {
 
     /// Unbiased integer in [0, n) via rejection sampling.
     pub fn below(&mut self, n: usize) -> usize {
-        if n <= 1 {
+        assert!(n > 0, "Rng::below requires a positive bound");
+        if n == 1 {
             return 0;
         }
         let bound = n as u64;
-        let limit = u64::MAX - (u64::MAX % bound);
+        // Values below this threshold would make the accepted range size not
+        // divisible by `bound`. This is Lemire's standard threshold formula.
+        let threshold = bound.wrapping_neg() % bound;
         loop {
             let r = self.next_u64();
-            if r < limit {
+            if r >= threshold {
                 return (r % bound) as usize;
             }
         }
     }
 
-    /// Standard normal, Marsaglia polar method. Two variates per two logs.
+    /// Standard normal, Marsaglia polar method. One logarithm yields two draws.
     pub fn normal(&mut self) -> f32 {
         if self.has_spare {
             self.has_spare = false;
@@ -112,7 +113,7 @@ impl Rng {
 
     /// Gumbel(0,1). `argmax(logits + gumbel)` == sampling from softmax(logits).
     pub fn gumbel(&mut self) -> f32 {
-        let u = self.f32_unit().max(1e-7).min(1.0 - 1e-7);
+        let u = self.f32_unit().clamp(1e-7, 1.0 - 1e-7);
         -((-u.ln()).ln())
     }
 
@@ -124,7 +125,7 @@ impl Rng {
 
     /// Gamma(shape, 1) via Marsaglia-Tsang, with the `shape < 1` boost.
     pub fn gamma(&mut self, shape: f32) -> f32 {
-        if shape <= 0.0 {
+        if !shape.is_finite() || shape <= 0.0 {
             return 0.0;
         }
         if shape < 1.0 {
@@ -154,21 +155,23 @@ impl Rng {
 
     /// Symmetric Dirichlet(alpha, ..., alpha) of dimension `k`.
     pub fn dirichlet(&mut self, alpha: f32, k: usize) -> Vec<f32> {
+        if k == 0 {
+            return Vec::new();
+        }
+        if !alpha.is_finite() || alpha <= 0.0 {
+            return vec![1.0 / (k as f32); k];
+        }
         let mut out = vec![0.0f32; k];
-        let mut sum = 0.0f32;
+        let mut sum = 0.0f64;
         for i in 0..k {
             let g = self.gamma(alpha);
             out[i] = g;
-            sum += g;
+            sum += g as f64;
         }
-        if sum <= 0.0 {
-            let u = 1.0 / (k.max(1) as f32);
-            for i in 0..k {
-                out[i] = u;
-            }
-            return out;
+        if !sum.is_finite() || sum <= 0.0 {
+            return vec![1.0 / (k as f32); k];
         }
-        let inv = 1.0 / sum;
+        let inv = (1.0 / sum) as f32;
         for i in 0..k {
             out[i] *= inv;
         }
@@ -177,28 +180,31 @@ impl Rng {
 
     /// Sample an index from unnormalised non-negative weights.
     pub fn categorical(&mut self, w: &[f32]) -> usize {
-        let mut total = 0.0f32;
-        for i in 0..w.len() {
-            if w[i] > 0.0 {
-                total += w[i];
+        if w.is_empty() {
+            return 0;
+        }
+        let mut total = 0.0f64;
+        for &weight in w {
+            if weight.is_finite() && weight > 0.0 {
+                total += weight as f64;
             }
         }
         if total <= 0.0 {
-            return self.below(w.len().max(1));
+            return self.below(w.len());
         }
-        let mut r = self.f32_unit() * total;
-        for i in 0..w.len() {
-            if w[i] > 0.0 {
-                r -= w[i];
+        let mut r = (self.f32_unit() as f64) * total;
+        for (i, &weight) in w.iter().enumerate() {
+            if weight.is_finite() && weight > 0.0 {
+                r -= weight as f64;
                 if r <= 0.0 {
                     return i;
                 }
             }
         }
-        // Floating point fallback: last positive index.
+        // Floating-point fallback: last positive finite index.
         let mut last = 0usize;
-        for i in 0..w.len() {
-            if w[i] > 0.0 {
+        for (i, &weight) in w.iter().enumerate() {
+            if weight.is_finite() && weight > 0.0 {
                 last = i;
             }
         }
@@ -214,9 +220,7 @@ impl Rng {
         let mut i = n - 1;
         while i > 0 {
             let j = self.below(i + 1);
-            let tmp = v[i];
-            v[i] = v[j];
-            v[j] = tmp;
+            v.swap(i, j);
             i -= 1;
         }
     }
