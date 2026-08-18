@@ -1,0 +1,5 @@
+# The kernels read as mathematics; 100-column wrapping breaks formulas across
+# lines and hurts more than it helps. Everything else is stock rustfmt, and CI
+# enforces it with `cargo fmt --check`.
+max_width = 132
+use_small_heuristics = "Max"

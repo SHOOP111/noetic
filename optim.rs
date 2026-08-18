@@ -2,6 +2,7 @@
 //! a step is a flat pass over contiguous f32 buffers.
 
 use crate::autograd::Graph;
+use crate::ckpt::{Ckpt, AUX_PREFIX};
 
 /// AdamW: Adam with *decoupled* weight decay (decay is applied to the weight,
 /// not folded into the gradient, so it does not interact with the adaptive
@@ -66,6 +67,43 @@ impl AdamW {
                 g.val[id][i] -= lr * upd;
             }
         }
+    }
+
+    /// Moment buffers as checkpointable tensors. Without these a resumed run
+    /// restarts Adam from zero momentum, which visibly dents the loss curve.
+    pub fn state_tensors(&self, g: &Graph) -> Vec<(String, Vec<usize>, Vec<f32>)> {
+        let mut out = Vec::with_capacity(self.m.len() * 2);
+        for p in 0..g.params.len() {
+            let name = &g.params[p].name;
+            let len = self.m[p].len();
+            out.push((format!("{}adamw.m.{}", AUX_PREFIX, name), vec![len], self.m[p].clone()));
+            out.push((format!("{}adamw.v.{}", AUX_PREFIX, name), vec![len], self.v[p].clone()));
+        }
+        out
+    }
+
+    /// Restore moments saved by [`AdamW::state_tensors`]. Returns `false` when
+    /// the checkpoint carries no optimizer state; errors when it carries state
+    /// that does not fit the live parameter set.
+    pub fn load_state(&mut self, g: &Graph, ckpt: &Ckpt, steps_key: &str) -> Result<bool, String> {
+        let first = format!("{}adamw.m.{}", AUX_PREFIX, g.params[0].name);
+        if !ckpt.tensors.contains_key(&first) {
+            return Ok(false);
+        }
+        for p in 0..g.params.len() {
+            let name = &g.params[p].name;
+            let m_key = format!("{}adamw.m.{}", AUX_PREFIX, name);
+            let v_key = format!("{}adamw.v.{}", AUX_PREFIX, name);
+            let m = ckpt.tensors.get(&m_key).ok_or_else(|| format!("checkpoint is missing optimizer state '{}'", m_key))?;
+            let v = ckpt.tensors.get(&v_key).ok_or_else(|| format!("checkpoint is missing optimizer state '{}'", v_key))?;
+            if m.len() != self.m[p].len() || v.len() != self.v[p].len() {
+                return Err(format!("optimizer state for '{}' has the wrong length", name));
+            }
+            self.m[p].copy_from_slice(m);
+            self.v[p].copy_from_slice(v);
+        }
+        self.t = ckpt.meta.get(steps_key).and_then(|value| value.parse::<u64>().ok()).unwrap_or(0);
+        Ok(true)
     }
 }
 
@@ -142,13 +180,7 @@ impl Schedule {
             return self.peak * ((step + 1) as f32) / (self.warmup as f32);
         }
         let span = if self.total > self.warmup { self.total - self.warmup } else { 1 };
-        let mut frac = ((step - self.warmup) as f32) / (span as f32);
-        if frac < 0.0 {
-            frac = 0.0;
-        }
-        if frac > 1.0 {
-            frac = 1.0;
-        }
+        let frac = (((step - self.warmup) as f32) / (span as f32)).clamp(0.0, 1.0);
         let pi = std::f32::consts::PI;
         self.min + 0.5 * (self.peak - self.min) * (1.0 + (pi * frac).cos())
     }

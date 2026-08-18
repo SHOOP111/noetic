@@ -12,7 +12,7 @@ use crate::infer::{step as infer_step, LmState};
 use crate::model::{Lm, LmConfig};
 use crate::optim::AdamW;
 use crate::rng::Rng;
-use crate::scan::{scan_log_depth, scan_sequential};
+use crate::scan::{scan_chunked, scan_sequential};
 use crate::sdm::{flip_bits, hamming, random_bits, Sdm};
 use crate::tensor::{gemm_nn, gemm_nn_naive, gemm_nt, gemm_tn};
 
@@ -83,7 +83,7 @@ fn test_scan_equivalence(threads: usize, rng: &mut Rng) -> bool {
     let mut sequential = vec![0.0f32; batch * t * d];
     let mut parallel = vec![0.0f32; batch * t * d];
     scan_sequential(&a, &b, &mut sequential, batch, t, d, threads);
-    scan_log_depth(&a, &b, &mut parallel, batch, t, d, threads);
+    scan_chunked(&a, &b, &mut parallel, batch, t, d, threads);
     let mut scan_error = 0.0f32;
     for i in 0..sequential.len() {
         scan_error = scan_error.max((sequential[i] - parallel[i]).abs());
@@ -100,7 +100,7 @@ fn test_scan_equivalence(threads: usize, rng: &mut Rng) -> bool {
     report(
         "parallel scan == recurrence",
         pass,
-        &format!("log-depth vs seq {:.2e}, seq vs scalar {:.2e}", scan_error, reference_error),
+        &format!("chunked vs seq {:.2e}, seq vs scalar {:.2e}", scan_error, reference_error),
     )
 }
 
@@ -116,12 +116,14 @@ fn test_scan_grad(threads: usize, rng: &mut Rng) -> bool {
         b_values[i] = rng.normal();
         weights[i] = rng.normal();
     }
-    let pa = graph.param("pa", vec![n], a_values, false);
-    let pb = graph.param("pb", vec![n], b_values, false);
+    let pa = graph.param("pa", vec![batch * t, d], a_values, false);
+    let pb = graph.param("pb", vec![batch * t, d], b_values, false);
     // Constants referenced by a reusable graph builder must be below the reset
     // watermark. The old test created this after seal_params(), so reset()
     // recycled its node id and accidentally differentiated a different graph.
-    let weight = graph.constant(vec![n], weights);
+    // The shape must match `scan`'s [batch * t, d] output exactly: elementwise
+    // ops compare shapes, not just element counts.
+    let weight = graph.constant(vec![batch * t, d], weights);
     graph.seal_params();
 
     let build = |g: &mut Graph| -> usize {
@@ -161,6 +163,61 @@ fn test_scan_grad(threads: usize, rng: &mut Rng) -> bool {
     }
     let pass = max_relative < 2e-2;
     report("scan gradient (finite diff)", pass, &format!("max rel err {:.2e}", max_relative))
+}
+
+/// Finite-difference coverage for the tape ops the language model never builds
+/// (`sub`, `scale`, `gelu`, and the NN-layout matrix product). Without this the
+/// backward arms for four of the twenty-two differentiable ops are dead code.
+fn test_aux_op_grads(threads: usize, rng: &mut Rng) -> bool {
+    let (m, k, n) = (3usize, 4usize, 2usize);
+    let mut graph = Graph::new(threads);
+    let left: Vec<f32> = (0..m * k).map(|_| rng.normal()).collect();
+    let right: Vec<f32> = (0..k * n).map(|_| rng.normal()).collect();
+    let offset: Vec<f32> = (0..m * n).map(|_| rng.normal()).collect();
+    let weights: Vec<f32> = (0..m * n).map(|_| rng.normal()).collect();
+    let pa = graph.param("left", vec![m, k], left, false);
+    let pb = graph.param("right", vec![k, n], right, false);
+    let pc = graph.param("offset", vec![m, n], offset, false);
+    let weight = graph.constant(vec![m, n], weights);
+    graph.seal_params();
+
+    let build = |g: &mut Graph| -> usize {
+        let product = g.matmul_nn(pa, pb, m, k, n);
+        let shifted = g.sub(product, pc);
+        let scaled = g.scale(shifted, 0.75);
+        let activated = g.gelu(scaled);
+        let weighted = g.mul(activated, weight);
+        g.sum(weighted)
+    };
+
+    graph.reset();
+    graph.zero_grad();
+    let loss = build(&mut graph);
+    graph.backward(loss);
+    let analytic: Vec<Vec<f32>> = vec![graph.grad[pa].clone(), graph.grad[pb].clone(), graph.grad[pc].clone()];
+
+    let eps = 1e-3f32;
+    let mut max_relative = 0.0f32;
+    for (slot, id) in [pa, pb, pc].iter().copied().enumerate() {
+        for index in 0..graph.val[id].len() {
+            let original = graph.val[id][index];
+            graph.val[id][index] = original + eps;
+            graph.reset();
+            let upper_id = build(&mut graph);
+            let upper = graph.scalar(upper_id);
+            graph.val[id][index] = original - eps;
+            graph.reset();
+            let lower_id = build(&mut graph);
+            let lower = graph.scalar(lower_id);
+            graph.val[id][index] = original;
+            let numeric = (upper - lower) / (2.0 * eps);
+            let value = analytic[slot][index];
+            let denominator = value.abs().max(numeric.abs()).max(1e-2);
+            max_relative = max_relative.max((value - numeric).abs() / denominator);
+        }
+    }
+    let pass = max_relative < 2e-2;
+    report("aux op gradients (sub/scale/gelu/nn)", pass, &format!("max rel err {:.2e}", max_relative))
 }
 
 fn test_model_grad(threads: usize, rng: &mut Rng) -> bool {
@@ -210,11 +267,7 @@ fn test_model_grad(threads: usize, rng: &mut Rng) -> bool {
         }
     }
     let pass = max_relative < 3e-2;
-    report(
-        "full model gradient",
-        pass,
-        &format!("{} coords, max rel err {:.2e} ({})", checks, max_relative, worst),
-    )
+    report("full model gradient", pass, &format!("{} coords, max rel err {:.2e} ({})", checks, max_relative, worst))
 }
 
 fn test_stream_matches_batch(threads: usize, rng: &mut Rng) -> bool {
@@ -290,11 +343,7 @@ fn test_bpe(rng: &mut Rng) -> bool {
     ok &= bpe.decode_bytes(&ids).as_deref() == Some(arbitrary.as_slice());
     ok &= bpe.decode_bytes(&[bpe.vocab_size() as u32]).is_none();
 
-    report(
-        "BPE roundtrip + raw bytes",
-        ok,
-        &format!("vocab {}, ~{:.2} bytes/token", bpe.vocab_size(), ratio),
-    )
+    report("BPE roundtrip + raw bytes", ok, &format!("vocab {}, ~{:.2} bytes/token", bpe.vocab_size(), ratio))
 }
 
 fn test_ckpt(threads: usize, rng: &mut Rng) -> bool {
@@ -303,7 +352,14 @@ fn test_ckpt(threads: usize, rng: &mut Rng) -> bool {
     let mut r1 = rng.fork();
     let _model1 = Lm::new(&mut first, &mut r1, cfg);
     first.seal_params();
-    let path = "noetic_selftest.ckpt";
+    // Unique, temp-directory path: a fixed name in the working directory races
+    // with a concurrent `cargo test` / `noetic selftest` and litters the repo.
+    let unique = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|elapsed| elapsed.as_nanos()).unwrap_or(0);
+    let path_buf = std::env::temp_dir().join(format!("noetic-selftest-{}-{}.ckpt", std::process::id(), unique));
+    let path = match path_buf.to_str() {
+        Some(text) => text,
+        None => return report("checkpoint roundtrip", false, "temporary path is not valid UTF-8"),
+    };
     let meta = vec![("vocab".to_string(), cfg.vocab.to_string())];
     if ckpt::save(path, &first, &meta).is_err() {
         return report("checkpoint roundtrip", false, "save failed");
@@ -337,11 +393,7 @@ fn test_ckpt(threads: usize, rng: &mut Rng) -> bool {
     }
     let _ = std::fs::remove_file(path);
     let pass = error == 0.0 && missing == 0 && mismatch == 0 && detected;
-    report(
-        "checkpoint + CRC guard",
-        pass,
-        &format!("{} tensors bit-exact, corruption detected: {}", loaded, detected),
-    )
+    report("checkpoint + CRC guard", pass, &format!("{} tensors bit-exact, corruption detected: {}", loaded, detected))
 }
 
 fn test_sdm(rng: &mut Rng) -> bool {
@@ -401,11 +453,7 @@ fn test_rng() -> bool {
         chi_square += delta * delta / expected;
     }
     let pass = mean.abs() < 0.02 && (variance - 1.0).abs() < 0.05 && chi_square < 27.9;
-    report(
-        "RNG normal + uniformity",
-        pass,
-        &format!("mean {:.4}, var {:.4}, chi2(9) {:.1}", mean, variance, chi_square),
-    )
+    report("RNG normal + uniformity", pass, &format!("mean {:.4}, var {:.4}, chi2(9) {:.1}", mean, variance, chi_square))
 }
 
 fn test_learning(threads: usize, rng: &mut Rng) -> bool {
@@ -418,10 +466,7 @@ fn test_learning(threads: usize, rng: &mut Rng) -> bool {
     for id in &mut ids {
         *id = rng.below(cfg.vocab) as u32;
     }
-    let targets: Vec<u32> = ids
-        .iter()
-        .map(|&id| ((id as usize * 7 + 3) % cfg.vocab) as u32)
-        .collect();
+    let targets: Vec<u32> = ids.iter().map(|&id| ((id as usize * 7 + 3) % cfg.vocab) as u32).collect();
     let mut optimizer = AdamW::new(&graph, 0.0);
     let uniform_loss = (cfg.vocab as f32).ln();
     let mut first = 0.0f32;
@@ -439,11 +484,7 @@ fn test_learning(threads: usize, rng: &mut Rng) -> bool {
         }
     }
     let pass = last < 0.35 * uniform_loss && last < first;
-    report(
-        "learns a mapping (overfit)",
-        pass,
-        &format!("ln(V) {:.3} -> start {:.3} -> end {:.3}", uniform_loss, first, last),
-    )
+    report("learns a mapping (overfit)", pass, &format!("ln(V) {:.3} -> start {:.3} -> end {:.3}", uniform_loss, first, last))
 }
 
 pub fn run_all(threads: usize, seed: u64) -> bool {
@@ -454,6 +495,7 @@ pub fn run_all(threads: usize, seed: u64) -> bool {
     ok = test_gemm(threads, &mut rng) && ok;
     ok = test_scan_equivalence(threads, &mut rng) && ok;
     ok = test_scan_grad(threads, &mut rng) && ok;
+    ok = test_aux_op_grads(threads, &mut rng) && ok;
     ok = test_model_grad(threads, &mut rng) && ok;
     ok = test_stream_matches_batch(threads, &mut rng) && ok;
     ok = test_optimizer(threads) && ok;
@@ -473,8 +515,365 @@ pub fn run_all(threads: usize, seed: u64) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use crate::autograd::{Nid, ScanPolicy};
+
+    // One `#[test]` per check, so a regression names itself instead of hiding
+    // behind a single monolithic "engine selftest" failure.
+    const THREADS: usize = 2;
+    const SEED: u64 = 20250816;
+
+    fn rng() -> Rng {
+        Rng::new(SEED)
+    }
+
     #[test]
-    fn complete_engine_selftest() {
-        assert!(super::run_all(2, 20250816));
+    fn gemm_matches_reference() {
+        assert!(test_gemm(THREADS, &mut rng()));
+    }
+
+    #[test]
+    fn scan_variants_agree() {
+        assert!(test_scan_equivalence(THREADS, &mut rng()));
+    }
+
+    #[test]
+    fn scan_gradient_matches_finite_differences() {
+        assert!(test_scan_grad(THREADS, &mut rng()));
+    }
+
+    /// The chunked kernel is reachable through `Graph::scan` via `ScanPolicy`;
+    /// forward values *and* gradients must match the sequential kernel, or the
+    /// automatic policy would silently change results.
+    #[test]
+    fn scan_policies_agree_through_the_tape() {
+        let (batch, t, d) = (2usize, 40usize, 3usize);
+        let n = batch * t * d;
+        let mut r = rng();
+        let a_raw: Vec<f32> = (0..n).map(|_| r.uniform(0.05, 0.95)).collect();
+        let b_raw: Vec<f32> = (0..n).map(|_| r.normal() * 0.5).collect();
+        let weight: Vec<f32> = (0..n).map(|_| r.normal()).collect();
+
+        let mut results = Vec::new();
+        for policy in [ScanPolicy::Sequential, ScanPolicy::Chunked, ScanPolicy::Auto] {
+            let mut g = Graph::new(THREADS);
+            g.scan_policy = policy;
+            let pa = g.param("a", vec![batch * t, d], a_raw.clone(), false);
+            let pb = g.param("b", vec![batch * t, d], b_raw.clone(), false);
+            g.seal_params();
+            let h = g.scan(pa, pb, batch, t, d);
+            let w = g.input(vec![batch * t, d], weight.clone());
+            let prod = g.mul(h, w);
+            let loss = g.sum(prod);
+            g.zero_grad();
+            g.backward(loss);
+            results.push((g.val[h].clone(), g.grad[pa].clone(), g.grad[pb].clone()));
+        }
+
+        for (index, (h, ga, gb)) in results.iter().enumerate().skip(1) {
+            let reference = &results[0];
+            for i in 0..n {
+                let tol = 2e-5;
+                assert!((h[i] - reference.0[i]).abs() < tol, "policy {} forward mismatch at {}", index, i);
+                assert!((ga[i] - reference.1[i]).abs() < tol, "policy {} grad a mismatch at {}", index, i);
+                assert!((gb[i] - reference.2[i]).abs() < tol, "policy {} grad b mismatch at {}", index, i);
+            }
+        }
+    }
+
+    #[test]
+    fn aux_op_gradients_match_finite_differences() {
+        assert!(test_aux_op_grads(THREADS, &mut rng()));
+    }
+
+    /// Elementwise activations are perfectly conditioned for central
+    /// differences, so their gradients must agree to ~1e-4 relative - not to
+    /// the 3e-2 the whole-model check has to tolerate. Written after a
+    /// deliberate 2% error in the SiLU derivative passed every other test in
+    /// this repository, including the end-to-end verifier.
+    #[test]
+    fn elementwise_activation_gradients_are_tight() {
+        // (name, forward through the tape)
+        type Build = fn(&mut Graph, Nid) -> Nid;
+        let ops: [(&str, Build); 5] = [
+            ("silu", |g, x| g.silu(x)),
+            ("gelu", |g, x| g.gelu(x)),
+            ("sigmoid", |g, x| g.sigmoid(x)),
+            ("tanh", |g, x| g.tanh(x)),
+            ("one_minus", |g, x| g.one_minus(x)),
+        ];
+        let n = 15usize;
+        // A spread that covers both saturating tails and the interesting middle.
+        let base: Vec<f32> = (0..n).map(|i| -3.5 + 0.5 * (i as f32)).collect();
+        let weight: Vec<f32> = (0..n).map(|i| 1.0 - 0.1 * (i as f32)).collect();
+
+        for (name, build) in ops {
+            let loss_of = |xs: &[f32]| -> f64 {
+                let mut g = Graph::new(1);
+                let x = g.param("x", vec![n], xs.to_vec(), false);
+                g.seal_params();
+                let y = build(&mut g, x);
+                // Accumulate the weighted sum outside the tape in f64 so the
+                // finite difference is limited by the op, not by summation.
+                let mut total = 0.0f64;
+                for i in 0..n {
+                    total += (g.val[y][i] as f64) * (weight[i] as f64);
+                }
+                total
+            };
+
+            let mut g = Graph::new(1);
+            let x = g.param("x", vec![n], base.clone(), false);
+            g.seal_params();
+            let y = build(&mut g, x);
+            let w = g.input(vec![n], weight.clone());
+            let prod = g.mul(y, w);
+            let loss = g.sum(prod);
+            g.zero_grad();
+            g.backward(loss);
+            let analytic = g.grad[x].clone();
+
+            let eps = 1e-2f64;
+            for i in 0..n {
+                let mut plus = base.clone();
+                let mut minus = base.clone();
+                plus[i] = (base[i] as f64 + eps) as f32;
+                minus[i] = (base[i] as f64 - eps) as f32;
+                let numeric = (loss_of(&plus) - loss_of(&minus)) / (2.0 * eps);
+                // Absolute, not relative: these gradients are O(0.1), so a
+                // relative bound with a "+1" denominator would swallow a 3%
+                // error. The measured noise floor on correct code is 2.3e-5,
+                // so 2e-4 leaves an order of magnitude of headroom while still
+                // catching a 2% slip in any derivative.
+                let error = (numeric - analytic[i] as f64).abs();
+                assert!(
+                    error < 2e-4,
+                    "{} gradient at x = {}: analytic {}, finite difference {}, abs err {:.2e}",
+                    name,
+                    base[i],
+                    analytic[i],
+                    numeric,
+                    error
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn model_gradient_matches_finite_differences() {
+        assert!(test_model_grad(THREADS, &mut rng()));
+    }
+
+    #[test]
+    fn streaming_decode_matches_batched_forward() {
+        assert!(test_stream_matches_batch(THREADS, &mut rng()));
+    }
+
+    /// The happy-path parity check uses one shape. These are the shapes that
+    /// break circular-buffer indexing: a degenerate kernel, a kernel longer
+    /// than the sequence, a single-token sequence, and more than one layer.
+    #[test]
+    fn streaming_matches_batched_across_awkward_configs() {
+        let cases: [(usize, usize, usize); 5] = [
+            // (conv_k, n_layer, sequence length)
+            (1, 1, 6),
+            (7, 1, 3),
+            (4, 3, 9),
+            (4, 1, 1),
+            (2, 2, 16),
+        ];
+        for (conv_k, n_layer, t) in cases {
+            let mut r = rng();
+            let cfg = LmConfig { conv_k, n_layer, ..tiny_cfg(17) };
+            cfg.check().unwrap_or_else(|error| panic!("bad test config: {}", error));
+            let mut graph = Graph::new(THREADS);
+            let model = Lm::new(&mut graph, &mut r, cfg);
+            graph.seal_params();
+            let ids: Vec<u32> = (0..t).map(|_| r.below(cfg.vocab) as u32).collect();
+
+            graph.reset();
+            graph.no_grad = true;
+            let logits = model.logits(&mut graph, &ids, 1, t);
+            let batched = graph.val[logits].clone();
+            graph.no_grad = false;
+
+            let mut state = LmState::new(&cfg);
+            let mut error = 0.0f32;
+            for (i, &id) in ids.iter().enumerate() {
+                let row = infer_step(&graph, &model, &mut state, id);
+                for token in 0..cfg.vocab {
+                    error = error.max((row[token] - batched[i * cfg.vocab + token]).abs());
+                }
+            }
+            assert!(
+                error < 2e-3,
+                "streaming diverged from batched for conv_k {}, layers {}, t {}: max diff {:.3e}",
+                conv_k,
+                n_layer,
+                t,
+                error
+            );
+        }
+    }
+
+    /// A kernel wider than the sequence means every tap reads a clamped or
+    /// zero-padded position; the backward pass must not credit those taps.
+    #[test]
+    fn dwconv_gradient_survives_kernel_longer_than_sequence() {
+        let (batch, t, d, k) = (2usize, 3usize, 2usize, 6usize);
+        let n = batch * t * d;
+        let mut r = rng();
+        let x_raw: Vec<f32> = (0..n).map(|_| r.normal()).collect();
+        let w_raw: Vec<f32> = (0..k * d).map(|_| r.normal() * 0.5).collect();
+        let b_raw: Vec<f32> = (0..d).map(|_| r.normal() * 0.1).collect();
+        let weight: Vec<f32> = (0..n).map(|_| r.normal()).collect();
+
+        let loss_of = |xs: &[f32], ws: &[f32], bs: &[f32]| -> f32 {
+            let mut g = Graph::new(THREADS);
+            let x = g.param("x", vec![batch * t, d], xs.to_vec(), false);
+            let w = g.param("w", vec![k, d], ws.to_vec(), false);
+            let bias = g.param("b", vec![d], bs.to_vec(), false);
+            g.seal_params();
+            let y = g.dwconv(x, w, bias, batch, t, d, k);
+            let m = g.input(vec![batch * t, d], weight.clone());
+            let prod = g.mul(y, m);
+            let loss = g.sum(prod);
+            g.scalar(loss)
+        };
+
+        let mut g = Graph::new(THREADS);
+        let x = g.param("x", vec![batch * t, d], x_raw.clone(), false);
+        let w = g.param("w", vec![k, d], w_raw.clone(), false);
+        let bias = g.param("b", vec![d], b_raw.clone(), false);
+        g.seal_params();
+        let y = g.dwconv(x, w, bias, batch, t, d, k);
+        let m = g.input(vec![batch * t, d], weight.clone());
+        let prod = g.mul(y, m);
+        let loss = g.sum(prod);
+        g.zero_grad();
+        g.backward(loss);
+        let (gx, gw, gb) = (g.grad[x].clone(), g.grad[w].clone(), g.grad[bias].clone());
+
+        let eps = 1e-3f32;
+        let mut worst = 0.0f32;
+        for i in 0..n {
+            let mut plus = x_raw.clone();
+            let mut minus = x_raw.clone();
+            plus[i] += eps;
+            minus[i] -= eps;
+            let fd = (loss_of(&plus, &w_raw, &b_raw) - loss_of(&minus, &w_raw, &b_raw)) / (2.0 * eps);
+            worst = worst.max((fd - gx[i]).abs() / (1.0 + fd.abs()));
+        }
+        for i in 0..k * d {
+            let mut plus = w_raw.clone();
+            let mut minus = w_raw.clone();
+            plus[i] += eps;
+            minus[i] -= eps;
+            let fd = (loss_of(&x_raw, &plus, &b_raw) - loss_of(&x_raw, &minus, &b_raw)) / (2.0 * eps);
+            worst = worst.max((fd - gw[i]).abs() / (1.0 + fd.abs()));
+        }
+        for i in 0..d {
+            let mut plus = b_raw.clone();
+            let mut minus = b_raw.clone();
+            plus[i] += eps;
+            minus[i] -= eps;
+            let fd = (loss_of(&x_raw, &w_raw, &plus) - loss_of(&x_raw, &w_raw, &minus)) / (2.0 * eps);
+            worst = worst.max((fd - gb[i]).abs() / (1.0 + fd.abs()));
+        }
+        assert!(worst < 5e-3, "dwconv gradient with k > t is wrong: max rel err {:.3e}", worst);
+    }
+
+    #[test]
+    fn adamw_converges() {
+        assert!(test_optimizer(THREADS));
+    }
+
+    #[test]
+    fn model_learns_a_fixed_mapping() {
+        assert!(test_learning(THREADS, &mut rng()));
+    }
+
+    #[test]
+    fn bpe_round_trips_text_and_raw_bytes() {
+        assert!(test_bpe(&mut rng()));
+    }
+
+    #[test]
+    fn checkpoints_round_trip_and_detect_corruption() {
+        assert!(test_ckpt(THREADS, &mut rng()));
+    }
+
+    #[test]
+    fn sparse_memory_recalls_from_a_noisy_cue() {
+        assert!(test_sdm(&mut rng()));
+    }
+
+    #[test]
+    fn rng_moments_and_uniformity_hold() {
+        assert!(test_rng());
+    }
+
+    /// The samplers that nothing in the CLI path happens to call still have to
+    /// be right, or they are a trap for library users.
+    #[test]
+    fn auxiliary_distributions_have_the_right_moments() {
+        let n = 120_000usize;
+        let mut r = Rng::new(0x5EED_1234);
+
+        // Exponential(1): mean 1, variance 1, strictly positive.
+        let mut mean = 0.0f64;
+        let mut second = 0.0f64;
+        for _ in 0..n {
+            let value = r.exponential() as f64;
+            assert!(value > 0.0, "exponential returned {}", value);
+            mean += value;
+            second += value * value;
+        }
+        mean /= n as f64;
+        let variance = second / (n as f64) - mean * mean;
+        assert!((mean - 1.0).abs() < 0.02, "exponential mean {:.4}", mean);
+        assert!((variance - 1.0).abs() < 0.06, "exponential variance {:.4}", variance);
+
+        // Gumbel(0,1): mean = Euler-Mascheroni, variance = pi^2/6.
+        let mut mean = 0.0f64;
+        let mut second = 0.0f64;
+        for _ in 0..n {
+            let value = r.gumbel() as f64;
+            mean += value;
+            second += value * value;
+        }
+        mean /= n as f64;
+        let variance = second / (n as f64) - mean * mean;
+        assert!((mean - 0.577_215_66).abs() < 0.03, "gumbel mean {:.4}", mean);
+        assert!((variance - std::f64::consts::PI * std::f64::consts::PI / 6.0).abs() < 0.12, "gumbel variance {:.4}", variance);
+
+        // The Gumbel-max trick must agree with softmax sampling frequencies.
+        let logits = [1.0f32, 0.0, -1.0];
+        let mut counts = [0usize; 3];
+        let draws = 60_000usize;
+        for _ in 0..draws {
+            let mut best = 0usize;
+            let mut best_value = f32::NEG_INFINITY;
+            for (index, &logit) in logits.iter().enumerate() {
+                let perturbed = logit + r.gumbel();
+                if perturbed > best_value {
+                    best_value = perturbed;
+                    best = index;
+                }
+            }
+            counts[best] += 1;
+        }
+        let total: f32 = logits.iter().map(|l| l.exp()).sum();
+        for (index, &logit) in logits.iter().enumerate() {
+            let expected = logit.exp() / total;
+            let observed = (counts[index] as f32) / (draws as f32);
+            assert!(
+                (observed - expected).abs() < 0.01,
+                "gumbel-max frequency for {} was {:.4}, softmax says {:.4}",
+                index,
+                observed,
+                expected
+            );
+        }
     }
 }

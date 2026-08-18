@@ -29,11 +29,7 @@ impl LmState {
         let conv_len = cfg.conv_k.checked_mul(e).expect("streaming convolution state is too large");
         let mut layers = Vec::with_capacity(cfg.n_layer);
         for _ in 0..cfg.n_layer {
-            layers.push(LayerState {
-                conv: vec![0.0f32; conv_len],
-                conv_head: cfg.conv_k - 1,
-                h: vec![0.0f32; e],
-            });
+            layers.push(LayerState { conv: vec![0.0f32; conv_len], conv_head: cfg.conv_k - 1, h: vec![0.0f32; e] });
         }
         LmState { layers }
     }
@@ -129,17 +125,7 @@ fn step_with_scratch(g: &Graph, m: &Lm, st: &mut LmState, scratch: &mut DecoderS
     assert_eq!(scratch.gated_mlp.len(), hidden, "decoder gated MLP scratch has the wrong width");
     assert_eq!(scratch.logits.len(), cfg.vocab, "decoder logit scratch has the wrong vocabulary");
 
-    let DecoderScratch {
-        x,
-        norm,
-        projection,
-        conv_value,
-        gated_state,
-        residual,
-        up,
-        gated_mlp,
-        logits,
-    } = scratch;
+    let DecoderScratch { x, norm, projection, conv_value, gated_state, residual, up, gated_mlp, logits } = scratch;
     let base = (token as usize) * d;
     x.copy_from_slice(&g.val[m.emb][base..base + d]);
 
@@ -190,15 +176,7 @@ fn step_with_scratch(g: &Graph, m: &Lm, st: &mut LmState, scratch: &mut DecoderS
         }
 
         let out_bias = block.ssm.out_proj.b.map(|id| &g.val[id][..]);
-        matvec_nt(
-            &g.val[block.ssm.out_proj.w],
-            out_bias,
-            gated_state.as_slice(),
-            residual.as_mut_slice(),
-            d,
-            e,
-            threads,
-        );
+        matvec_nt(&g.val[block.ssm.out_proj.w], out_bias, gated_state.as_slice(), residual.as_mut_slice(), d, e, threads);
         for j in 0..d {
             x[j] += residual[j];
         }
@@ -206,43 +184,19 @@ fn step_with_scratch(g: &Graph, m: &Lm, st: &mut LmState, scratch: &mut DecoderS
         // ---- feed-forward branch ----
         rms_norm_vec(x.as_slice(), &g.val[block.norm2.g], cfg.eps, norm.as_mut_slice());
         let up_bias = block.mlp.up.b.map(|id| &g.val[id][..]);
-        matvec_nt(
-            &g.val[block.mlp.up.w],
-            up_bias,
-            norm.as_slice(),
-            up.as_mut_slice(),
-            mlp_projection,
-            d,
-            threads,
-        );
+        matvec_nt(&g.val[block.mlp.up.w], up_bias, norm.as_slice(), up.as_mut_slice(), mlp_projection, d, threads);
         for j in 0..hidden {
             gated_mlp[j] = silu(up[j]) * up[hidden + j];
         }
         let down_bias = block.mlp.down.b.map(|id| &g.val[id][..]);
-        matvec_nt(
-            &g.val[block.mlp.down.w],
-            down_bias,
-            gated_mlp.as_slice(),
-            residual.as_mut_slice(),
-            d,
-            hidden,
-            threads,
-        );
+        matvec_nt(&g.val[block.mlp.down.w], down_bias, gated_mlp.as_slice(), residual.as_mut_slice(), d, hidden, threads);
         for j in 0..d {
             x[j] += residual[j];
         }
     }
 
     rms_norm_vec(x.as_slice(), &g.val[m.norm_f.g], cfg.eps, norm.as_mut_slice());
-    matvec_nt(
-        &g.val[m.emb],
-        None,
-        norm.as_slice(),
-        logits.as_mut_slice(),
-        cfg.vocab,
-        d,
-        threads,
-    );
+    matvec_nt(&g.val[m.emb], None, norm.as_slice(), logits.as_mut_slice(), cfg.vocab, d, threads);
 }
 
 /// Advance the model by one token, mutating `st`. Returns logits over vocab.
@@ -295,32 +249,32 @@ pub fn sample_token(logits: &mut [f32], cfg: &SampleCfg, history: &[u32], rng: &
         return crate::tensor::argmax(logits) as u32;
     }
 
-    let temperature = if cfg.temperature.is_finite() && cfg.temperature > 1e-4 {
-        cfg.temperature
-    } else {
-        1e-4
-    };
+    let temperature = if cfg.temperature.is_finite() && cfg.temperature > 1e-4 { cfg.temperature } else { 1e-4 };
     for logit in logits.iter_mut() {
         *logit /= temperature;
     }
     softmax_inplace(logits);
 
-    let keep = if cfg.top_k == 0 || cfg.top_k > vocab {
-        vocab
-    } else {
-        cfg.top_k
-    };
+    let keep = if cfg.top_k == 0 || cfg.top_k > vocab { vocab } else { cfg.top_k };
     let mut indices: Vec<usize> = (0..vocab).collect();
     if keep < vocab {
         indices.select_nth_unstable_by(keep, |left, right| {
             let order = logits[*right].total_cmp(&logits[*left]);
-            if order == std::cmp::Ordering::Equal { left.cmp(right) } else { order }
+            if order == std::cmp::Ordering::Equal {
+                left.cmp(right)
+            } else {
+                order
+            }
         });
         indices.truncate(keep);
     }
     indices.sort_unstable_by(|left, right| {
         let order = logits[*right].total_cmp(&logits[*left]);
-        if order == std::cmp::Ordering::Equal { left.cmp(right) } else { order }
+        if order == std::cmp::Ordering::Equal {
+            left.cmp(right)
+        } else {
+            order
+        }
     });
 
     // p <= 0 has the useful deterministic interpretation "keep the best one".
@@ -356,14 +310,7 @@ mod tests {
 
     #[test]
     fn zero_nucleus_probability_keeps_exactly_the_best_token() {
-        let config = SampleCfg {
-            temperature: 1.0,
-            top_k: 0,
-            top_p: 0.0,
-            rep_penalty: 1.0,
-            rep_window: 0,
-            greedy: false,
-        };
+        let config = SampleCfg { temperature: 1.0, top_k: 0, top_p: 0.0, rep_penalty: 1.0, rep_window: 0, greedy: false };
         let mut logits = [f32::NAN, f32::INFINITY, f32::INFINITY, -2.0];
         let mut rng = Rng::new(7);
         assert_eq!(sample_token(&mut logits, &config, &[], &mut rng), 1);

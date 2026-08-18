@@ -11,6 +11,10 @@ keywords = ["machine-learning", "autodiff", "state-space-model", "bpe", "mcts"]
 categories = ["algorithms", "science"]
 
 # The source files intentionally live at the repository root.
+[lib]
+name = "noetic"
+path = "lib.rs"
+
 [[bin]]
 name = "noetic"
 path = "main.rs"

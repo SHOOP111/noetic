@@ -40,10 +40,7 @@ fn create_temp_file(path: &str) -> std::io::Result<(String, File)> {
             Err(error) => return Err(error),
         }
     }
-    Err(std::io::Error::new(
-        std::io::ErrorKind::AlreadyExists,
-        "could not allocate a unique tokenizer temporary file",
-    ))
+    Err(std::io::Error::new(std::io::ErrorKind::AlreadyExists, "could not allocate a unique tokenizer temporary file"))
 }
 
 impl Bpe {
@@ -170,20 +167,12 @@ impl Bpe {
             let new_id = bpe.vocab_size() as u32;
             bpe.push_merge(best_key.0, best_key.1);
             if verbose && bpe.merges.len() % 128 == 0 {
-                println!(
-                    "  merge {:>5}  count {:>8}  vocab {}",
-                    bpe.merges.len(),
-                    best_count,
-                    bpe.vocab_size()
-                );
+                println!("  merge {:>5}  count {:>8}  vocab {}", bpe.merges.len(), best_count, bpe.vocab_size());
             }
 
             // Remove the selected pair from the exact inverted index. Every
             // current occurrence is replaced below, so it cannot remain.
-            let affected: Vec<usize> = locations
-                .remove(&best_key)
-                .map(|set| set.into_iter().collect())
-                .unwrap_or_default();
+            let affected: Vec<usize> = locations.remove(&best_key).map(|set| set.into_iter().collect()).unwrap_or_default();
             counts.insert(best_key, 0);
 
             for word_index in affected {
@@ -392,10 +381,7 @@ mod tests {
 
     #[test]
     fn loader_rejects_exponential_token_expansion() {
-        let unique = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
+        let unique = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
         let path = std::env::temp_dir().join(format!("noetic-bpe-bomb-{}-{}.tok", std::process::id(), unique));
         let mut serialized = String::from("noetic-bpe 1\n22\n");
         for merge in 0..22u32 {

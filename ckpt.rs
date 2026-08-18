@@ -26,6 +26,10 @@ const VERSION: u32 = 1;
 const MAX_RANK: usize = 32;
 const MAX_ENTRIES: usize = 1_000_000;
 const MAX_CHECKPOINT_FILE_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+/// Reserved tensor-name prefix for non-model payloads (optimizer moments).
+/// `apply_exact` ignores this namespace, so adding optimizer state to a file
+/// does not weaken the "exactly the model tensors, nothing else" guarantee.
+pub const AUX_PREFIX: &str = "aux.";
 static TEMP_FILE_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
 pub fn crc32(data: &[u8]) -> u32 {
@@ -63,13 +67,10 @@ fn create_temp_file(path: &str) -> std::io::Result<(String, File)> {
             Err(error) => return Err(error),
         }
     }
-    Err(std::io::Error::new(
-        std::io::ErrorKind::AlreadyExists,
-        "could not allocate a unique checkpoint temporary file",
-    ))
+    Err(std::io::Error::new(std::io::ErrorKind::AlreadyExists, "could not allocate a unique checkpoint temporary file"))
 }
 
-fn serialized_size(g: &Graph, meta: &[(String, String)]) -> std::io::Result<usize> {
+fn serialized_size(g: &Graph, meta: &[(String, String)], extra: &[(String, Vec<usize>, Vec<f32>)]) -> std::io::Result<usize> {
     let mut bytes = (MAGIC.len() + 4 + 4 + 4 + 4) as u64;
     for (key, value) in meta {
         bytes = bytes
@@ -80,15 +81,21 @@ fn serialized_size(g: &Graph, meta: &[(String, String)]) -> std::io::Result<usiz
     }
     for parameter in &g.params {
         let id = parameter.id;
-        let shape_bytes = (g.shape[id].len() as u64)
-            .checked_mul(4)
-            .ok_or_else(|| bad("checkpoint shape size overflows"))?;
-        let value_bytes = (g.val[id].len() as u64)
-            .checked_mul(4)
-            .ok_or_else(|| bad("checkpoint tensor size overflows"))?;
+        let shape_bytes = (g.shape[id].len() as u64).checked_mul(4).ok_or_else(|| bad("checkpoint shape size overflows"))?;
+        let value_bytes = (g.val[id].len() as u64).checked_mul(4).ok_or_else(|| bad("checkpoint tensor size overflows"))?;
         bytes = bytes
             .checked_add(12)
             .and_then(|size| size.checked_add(parameter.name.len() as u64))
+            .and_then(|size| size.checked_add(shape_bytes))
+            .and_then(|size| size.checked_add(value_bytes))
+            .ok_or_else(|| bad("checkpoint serialized size overflows"))?;
+    }
+    for (name, shape, values) in extra {
+        let shape_bytes = (shape.len() as u64).checked_mul(4).ok_or_else(|| bad("checkpoint shape size overflows"))?;
+        let value_bytes = (values.len() as u64).checked_mul(4).ok_or_else(|| bad("checkpoint tensor size overflows"))?;
+        bytes = bytes
+            .checked_add(12)
+            .and_then(|size| size.checked_add(name.len() as u64))
             .and_then(|size| size.checked_add(shape_bytes))
             .and_then(|size| size.checked_add(value_bytes))
             .ok_or_else(|| bad("checkpoint serialized size overflows"))?;
@@ -113,11 +120,25 @@ fn put_str(buf: &mut Vec<u8>, value: &str, what: &str) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Save every model parameter. Equivalent to [`save_with_aux`] with no aux
+/// tensors.
 pub fn save(path: &str, g: &Graph, meta: &[(String, String)]) -> std::io::Result<()> {
-    if meta.len() > MAX_ENTRIES || g.params.len() > MAX_ENTRIES {
+    save_with_aux(path, g, meta, &[])
+}
+
+/// Save model parameters plus auxiliary tensors (for example optimizer moments,
+/// which is what makes a training run resumable). Aux names must start with
+/// [`AUX_PREFIX`]; model parameters must not.
+pub fn save_with_aux(
+    path: &str,
+    g: &Graph,
+    meta: &[(String, String)],
+    extra: &[(String, Vec<usize>, Vec<f32>)],
+) -> std::io::Result<()> {
+    if meta.len() > MAX_ENTRIES || g.params.len().saturating_add(extra.len()) > MAX_ENTRIES {
         return Err(bad("checkpoint contains too many entries"));
     }
-    let mut buf: Vec<u8> = Vec::with_capacity(serialized_size(g, meta)?);
+    let mut buf: Vec<u8> = Vec::with_capacity(serialized_size(g, meta, extra)?);
     buf.extend_from_slice(MAGIC);
     put_u32(&mut buf, VERSION);
     put_u32(&mut buf, checked_u32(meta.len(), "metadata count")?);
@@ -134,37 +155,30 @@ pub fn save(path: &str, g: &Graph, meta: &[(String, String)]) -> std::io::Result
         put_str(&mut buf, value, "metadata value length")?;
     }
 
-    put_u32(&mut buf, checked_u32(g.params.len(), "tensor count")?);
-    let mut tensor_names = HashSet::with_capacity(g.params.len());
+    let total = g.params.len().checked_add(extra.len()).ok_or_else(|| bad("checkpoint entry count overflows"))?;
+    put_u32(&mut buf, checked_u32(total, "tensor count")?);
+    let mut tensor_names = HashSet::with_capacity(total);
     for param in &g.params {
         let id = param.id;
         if param.name.is_empty() {
             return Err(bad("checkpoint tensor names cannot be empty"));
         }
-        if !tensor_names.insert(param.name.as_str()) {
+        if param.name.starts_with(AUX_PREFIX) {
+            return Err(bad("model parameters cannot use the reserved 'aux.' name prefix"));
+        }
+        if !tensor_names.insert(param.name.clone()) {
             return Err(bad("checkpoint contains a duplicate tensor name"));
         }
-        put_str(&mut buf, &param.name, "tensor name length")?;
-        let shape = &g.shape[id];
-        if shape.len() > MAX_RANK {
-            return Err(bad("tensor rank exceeds the checkpoint format limit"));
+        write_tensor(&mut buf, &param.name, &g.shape[id], &g.val[id])?;
+    }
+    for (name, shape, values) in extra {
+        if !name.starts_with(AUX_PREFIX) {
+            return Err(bad("auxiliary checkpoint tensors must use the 'aux.' name prefix"));
         }
-        put_u32(&mut buf, checked_u32(shape.len(), "tensor rank")?);
-        for &dim in shape {
-            put_u32(&mut buf, checked_u32(dim, "tensor dimension")?);
+        if !tensor_names.insert(name.clone()) {
+            return Err(bad("checkpoint contains a duplicate tensor name"));
         }
-        let values = &g.val[id];
-        let expected = shape.iter().try_fold(1usize, |acc, &dim| acc.checked_mul(dim));
-        if expected != Some(values.len()) {
-            return Err(bad("live tensor shape does not match its value count"));
-        }
-        put_u32(&mut buf, checked_u32(values.len(), "tensor element count")?);
-        for &value in values {
-            if !value.is_finite() {
-                return Err(bad("checkpoint tensors must contain only finite values"));
-            }
-            buf.extend_from_slice(&value.to_le_bytes());
-        }
+        write_tensor(&mut buf, name, shape, values)?;
     }
 
     let checksum = crc32(&buf);
@@ -185,6 +199,29 @@ pub fn save(path: &str, g: &Graph, meta: &[(String, String)]) -> std::io::Result
     write_result
 }
 
+fn write_tensor(buf: &mut Vec<u8>, name: &str, shape: &[usize], values: &[f32]) -> std::io::Result<()> {
+    put_str(buf, name, "tensor name length")?;
+    if shape.len() > MAX_RANK {
+        return Err(bad("tensor rank exceeds the checkpoint format limit"));
+    }
+    put_u32(buf, checked_u32(shape.len(), "tensor rank")?);
+    for &dim in shape {
+        put_u32(buf, checked_u32(dim, "tensor dimension")?);
+    }
+    let expected = shape.iter().try_fold(1usize, |acc, &dim| acc.checked_mul(dim));
+    if expected != Some(values.len()) {
+        return Err(bad("live tensor shape does not match its value count"));
+    }
+    put_u32(buf, checked_u32(values.len(), "tensor element count")?);
+    for &value in values {
+        if !value.is_finite() {
+            return Err(bad("checkpoint tensors must contain only finite values"));
+        }
+        buf.extend_from_slice(&value.to_le_bytes());
+    }
+    Ok(())
+}
+
 pub struct Ckpt {
     pub meta: HashMap<String, String>,
     pub tensors: HashMap<String, Vec<f32>>,
@@ -193,23 +230,13 @@ pub struct Ckpt {
 
 impl Ckpt {
     pub fn require_usize(&self, key: &str) -> std::io::Result<usize> {
-        let value = self
-            .meta
-            .get(key)
-            .ok_or_else(|| bad(&format!("checkpoint metadata is missing '{}'", key)))?;
-        value
-            .parse::<usize>()
-            .map_err(|_| bad(&format!("checkpoint metadata '{}' is not a valid integer", key)))
+        let value = self.meta.get(key).ok_or_else(|| bad(&format!("checkpoint metadata is missing '{}'", key)))?;
+        value.parse::<usize>().map_err(|_| bad(&format!("checkpoint metadata '{}' is not a valid integer", key)))
     }
 
     pub fn require_f32(&self, key: &str) -> std::io::Result<f32> {
-        let value = self
-            .meta
-            .get(key)
-            .ok_or_else(|| bad(&format!("checkpoint metadata is missing '{}'", key)))?;
-        let parsed = value
-            .parse::<f32>()
-            .map_err(|_| bad(&format!("checkpoint metadata '{}' is not a valid number", key)))?;
+        let value = self.meta.get(key).ok_or_else(|| bad(&format!("checkpoint metadata is missing '{}'", key)))?;
+        let parsed = value.parse::<f32>().map_err(|_| bad(&format!("checkpoint metadata '{}' is not a valid number", key)))?;
         if !parsed.is_finite() {
             return Err(bad(&format!("checkpoint metadata '{}' must be finite", key)));
         }
@@ -226,13 +253,6 @@ impl Ckpt {
     pub fn meta_usize(&self, key: &str, default: usize) -> usize {
         match self.meta.get(key) {
             Some(value) => value.parse::<usize>().unwrap_or(default),
-            None => default,
-        }
-    }
-
-    pub fn meta_f32(&self, key: &str, default: f32) -> f32 {
-        match self.meta.get(key) {
-            Some(value) => value.parse::<f32>().unwrap_or(default),
             None => default,
         }
     }
@@ -290,12 +310,7 @@ pub fn load(path: &str) -> std::io::Result<Ckpt> {
     }
     let body = &raw[..raw.len() - 4];
     let checksum_bytes = &raw[raw.len() - 4..];
-    let expected_checksum = u32::from_le_bytes([
-        checksum_bytes[0],
-        checksum_bytes[1],
-        checksum_bytes[2],
-        checksum_bytes[3],
-    ]);
+    let expected_checksum = u32::from_le_bytes([checksum_bytes[0], checksum_bytes[1], checksum_bytes[2], checksum_bytes[3]]);
     if crc32(body) != expected_checksum {
         return Err(bad("checkpoint CRC mismatch (corrupt file)"));
     }
@@ -389,17 +404,19 @@ pub fn apply(g: &mut Graph, ckpt: &Ckpt) -> (usize, usize, usize) {
 
 /// Validate a complete checkpoint against a live graph and apply it
 /// transactionally. No parameter is changed unless every expected tensor is
-/// present with the exact shape and there are no unexpected tensors.
+/// present with the exact shape and there are no unexpected model tensors.
+/// Tensors in the reserved [`AUX_PREFIX`] namespace (optimizer state) are
+/// ignored here and applied by their own owner.
 pub fn apply_exact(g: &mut Graph, ckpt: &Ckpt) -> std::io::Result<usize> {
-    if ckpt.tensors.len() != g.params.len() || ckpt.shapes.len() != g.params.len() {
+    let model_tensors = ckpt.tensors.keys().filter(|name| !name.starts_with(AUX_PREFIX)).count();
+    let model_shapes = ckpt.shapes.keys().filter(|name| !name.starts_with(AUX_PREFIX)).count();
+    if model_tensors != g.params.len() || model_shapes != g.params.len() {
         return Err(bad("checkpoint tensor set does not exactly match the model"));
     }
     for parameter in &g.params {
         let id = parameter.id;
-        let values = ckpt
-            .tensors
-            .get(&parameter.name)
-            .ok_or_else(|| bad(&format!("checkpoint is missing tensor '{}'", parameter.name)))?;
+        let values =
+            ckpt.tensors.get(&parameter.name).ok_or_else(|| bad(&format!("checkpoint is missing tensor '{}'", parameter.name)))?;
         let shape = ckpt
             .shapes
             .get(&parameter.name)

@@ -31,16 +31,7 @@ pub struct LmConfig {
 
 impl LmConfig {
     pub fn small(vocab: usize) -> LmConfig {
-        LmConfig {
-            vocab,
-            d_model: 128,
-            n_layer: 2,
-            expand: 2,
-            conv_k: 4,
-            mlp_mult: 3,
-            eps: 1e-5,
-            tau_max: 128.0,
-        }
+        LmConfig { vocab, d_model: 128, n_layer: 2, expand: 2, conv_k: 4, mlp_mult: 3, eps: 1e-5, tau_max: 128.0 }
     }
 
     pub fn check(&self) -> Result<(), String> {
@@ -71,38 +62,16 @@ impl LmConfig {
         if !self.tau_max.is_finite() || self.tau_max < 1.0 {
             return Err("tau_max must be finite and at least one".to_string());
         }
-        let inner = self
-            .d_model
-            .checked_mul(self.expand)
-            .ok_or_else(|| "model inner width overflow".to_string())?;
-        let hidden = self
-            .d_model
-            .checked_mul(self.mlp_mult)
-            .ok_or_else(|| "model hidden width overflow".to_string())?;
-        let recurrent_projection = inner
-            .checked_mul(3)
-            .ok_or_else(|| "recurrent projection width overflow".to_string())?;
-        let mlp_projection = hidden
-            .checked_mul(2)
-            .ok_or_else(|| "MLP projection width overflow".to_string())?;
-        self.vocab
-            .checked_mul(self.d_model)
-            .ok_or_else(|| "embedding table is too large".to_string())?;
-        recurrent_projection
-            .checked_mul(self.d_model)
-            .ok_or_else(|| "recurrent input projection is too large".to_string())?;
-        self.conv_k
-            .checked_mul(inner)
-            .ok_or_else(|| "convolution parameter size overflow".to_string())?;
-        self.d_model
-            .checked_mul(inner)
-            .ok_or_else(|| "recurrent output projection is too large".to_string())?;
-        mlp_projection
-            .checked_mul(self.d_model)
-            .ok_or_else(|| "MLP input projection is too large".to_string())?;
-        self.d_model
-            .checked_mul(hidden)
-            .ok_or_else(|| "MLP output projection is too large".to_string())?;
+        let inner = self.d_model.checked_mul(self.expand).ok_or_else(|| "model inner width overflow".to_string())?;
+        let hidden = self.d_model.checked_mul(self.mlp_mult).ok_or_else(|| "model hidden width overflow".to_string())?;
+        let recurrent_projection = inner.checked_mul(3).ok_or_else(|| "recurrent projection width overflow".to_string())?;
+        let mlp_projection = hidden.checked_mul(2).ok_or_else(|| "MLP projection width overflow".to_string())?;
+        self.vocab.checked_mul(self.d_model).ok_or_else(|| "embedding table is too large".to_string())?;
+        recurrent_projection.checked_mul(self.d_model).ok_or_else(|| "recurrent input projection is too large".to_string())?;
+        self.conv_k.checked_mul(inner).ok_or_else(|| "convolution parameter size overflow".to_string())?;
+        self.d_model.checked_mul(inner).ok_or_else(|| "recurrent output projection is too large".to_string())?;
+        mlp_projection.checked_mul(self.d_model).ok_or_else(|| "MLP input projection is too large".to_string())?;
+        self.d_model.checked_mul(hidden).ok_or_else(|| "MLP output projection is too large".to_string())?;
         Ok(())
     }
 
@@ -172,15 +141,7 @@ impl SsmLayer {
         }
         let conv_w = g.param(&format!("{}.conv_w", name), vec![cfg.conv_k, e], conv_values, true);
         let conv_b = g.param(&format!("{}.conv_b", name), vec![e], vec![0.0f32; e], false);
-        let out_proj = Linear::new(
-            g,
-            rng,
-            &format!("{}.out_proj", name),
-            e,
-            cfg.d_model,
-            true,
-            init_std(e) * depth_scale,
-        );
+        let out_proj = Linear::new(g, rng, &format!("{}.out_proj", name), e, cfg.d_model, true, init_std(e) * depth_scale);
         SsmLayer { in_proj, conv_w, conv_b, out_proj, e, k: cfg.conv_k }
     }
 

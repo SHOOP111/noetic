@@ -15,17 +15,22 @@
 //! * `no_grad` mode stops the tape from recording, so evaluation costs nothing
 //!   extra in memory.
 
-use crate::scan::{scan_adjoint, scan_log_depth, scan_sequential};
+use crate::scan::{scan_adjoint, scan_chunked, scan_sequential};
 use crate::tensor::{gemm_nn, gemm_nt, gemm_tn, sigmoid};
 
 pub type Nid = usize;
 
+/// Upper bound on recycled activation buffers held between steps.
+const MAX_POOLED_BUFFERS: usize = 4096;
+
+/// sqrt(2/pi) and the cubic coefficient of the tanh GELU approximation, at f32
+/// precision so `tensor::gelu` and `Op::Gelu` agree exactly.
+const SQRT_2_OVER_PI: f32 = 0.797_884_6;
+const GELU_CUBIC: f32 = 0.044_715;
+
 #[inline]
 fn checked_numel(shape: &[usize]) -> usize {
-    shape
-        .iter()
-        .try_fold(1usize, |product, &dimension| product.checked_mul(dimension))
-        .expect("tensor shape product overflow")
+    shape.iter().try_fold(1usize, |product, &dimension| product.checked_mul(dimension)).expect("tensor shape product overflow")
 }
 
 #[inline]
@@ -35,10 +40,7 @@ fn checked_2(left: usize, right: usize, what: &str) -> usize {
 
 #[inline]
 fn checked_3(first: usize, second: usize, third: usize, what: &str) -> usize {
-    first
-        .checked_mul(second)
-        .and_then(|value| value.checked_mul(third))
-        .unwrap_or_else(|| panic!("{} size overflow", what))
+    first.checked_mul(second).and_then(|value| value.checked_mul(third)).unwrap_or_else(|| panic!("{} size overflow", what))
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -97,11 +99,30 @@ pub struct Graph {
     pub ids: Vec<Vec<u32>>,
     pub params: Vec<Param>,
     pub threads: usize,
+    /// Recycled activation buffers. `reset()` returns every activation here
+    /// instead of freeing it, so steady-state steps reuse memory.
+    pool: Vec<Vec<f32>>,
+    /// Fresh allocations served by `buf`. Steady-state steps should not grow it.
+    allocations: u64,
     pub no_grad: bool,
-    /// use the O(log T)-depth scan instead of the sequential one
-    pub scan_parallel: bool,
+    /// Scan implementation policy. See [`ScanPolicy`].
+    pub scan_policy: ScanPolicy,
     watermark: usize,
     sealed: bool,
+}
+
+/// Which prefix-scan kernel [`Graph::scan`] uses.
+///
+/// `Auto` is the default and picks the time-chunked kernel only when the batch
+/// axis is too narrow to keep the threads busy, because that is the only regime
+/// where chunking has ever measured faster here (see `scan.rs` for numbers: on
+/// a 4-core laptop it wins ~1.15x on cache-resident shapes and *loses* on
+/// DRAM-resident ones, so this is a latency knob, not a throughput win).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScanPolicy {
+    Auto,
+    Sequential,
+    Chunked,
 }
 
 impl Graph {
@@ -116,8 +137,10 @@ impl Graph {
             ids: Vec::new(),
             params: Vec::new(),
             threads: threads.max(1),
+            pool: Vec::new(),
+            allocations: 0,
             no_grad: false,
-            scan_parallel: false,
+            scan_policy: ScanPolicy::Auto,
             watermark: 0,
             sealed: false,
         }
@@ -125,6 +148,65 @@ impl Graph {
 
     pub fn nodes(&self) -> usize {
         self.val.len()
+    }
+
+    /// Number of buffers currently parked in the recycling pool.
+    pub fn pooled_buffers(&self) -> usize {
+        self.pool.len()
+    }
+
+    /// How many activation buffers have been allocated from scratch. Constant
+    /// across steady-state training steps once the pool has warmed up.
+    pub fn allocation_count(&self) -> u64 {
+        self.allocations
+    }
+
+    /// A buffer of length `n` whose contents are initialised but unspecified,
+    /// reusing pooled capacity when possible. Forward ops overwrite every
+    /// element they produce, so re-zeroing a recycled buffer would just be a
+    /// wasted pass over memory - `buf_zeroed` exists for the accumulating
+    /// (backward) case.
+    fn buf(&mut self, n: usize) -> Vec<f32> {
+        let mut index = None;
+        for (position, candidate) in self.pool.iter().enumerate().rev() {
+            if candidate.capacity() >= n {
+                index = Some(position);
+                break;
+            }
+        }
+        match index {
+            Some(position) => {
+                let mut buffer = self.pool.swap_remove(position);
+                if buffer.len() < n {
+                    buffer.resize(n, 0.0);
+                } else {
+                    buffer.truncate(n);
+                }
+                buffer
+            }
+            None => {
+                self.allocations = self.allocations.saturating_add(1);
+                vec![0.0f32; n]
+            }
+        }
+    }
+
+    /// A zeroed buffer of length `n`. Required wherever the consumer accumulates
+    /// into the buffer instead of writing every element.
+    fn buf_zeroed(&mut self, n: usize) -> Vec<f32> {
+        let mut buffer = self.buf(n);
+        for value in buffer.iter_mut() {
+            *value = 0.0;
+        }
+        buffer
+    }
+
+    fn recycle(&mut self, buffer: Vec<f32>) {
+        // Empty buffers carry no capacity worth keeping, and an unbounded pool
+        // would defeat the point of freeing activations.
+        if buffer.capacity() > 0 && self.pool.len() < MAX_POOLED_BUFFERS {
+            self.pool.push(buffer);
+        }
     }
 
     fn push(&mut self, shape: Vec<usize>, val: Vec<f32>, op: Op, req: bool) -> Nid {
@@ -168,10 +250,15 @@ impl Graph {
         self.sealed = true;
     }
 
-    /// Drop all activations, keep parameters + their gradients.
+    /// Retire all activations, keep parameters + their gradients. Activation
+    /// buffers move to the recycling pool rather than back to the allocator.
     pub fn reset(&mut self) {
         assert!(self.sealed, "call Graph::seal_params before Graph::reset");
         let w = self.watermark;
+        let retired: Vec<Vec<f32>> = self.val.drain(w..).chain(self.grad.drain(w..)).chain(self.aux.drain(w..)).collect();
+        for buffer in retired {
+            self.recycle(buffer);
+        }
         self.val.truncate(w);
         self.grad.truncate(w);
         self.shape.truncate(w);
@@ -210,7 +297,7 @@ impl Graph {
         let n = self.val[a].len();
         assert_eq!(n, self.val[b].len(), "add: shape mismatch");
         assert_eq!(self.shape[a], self.shape[b], "add: shape mismatch");
-        let mut out = vec![0.0f32; n];
+        let mut out = self.buf(n);
         for i in 0..n {
             out[i] = self.val[a][i] + self.val[b][i];
         }
@@ -223,7 +310,7 @@ impl Graph {
         let n = self.val[a].len();
         assert_eq!(n, self.val[b].len(), "sub: shape mismatch");
         assert_eq!(self.shape[a], self.shape[b], "sub: shape mismatch");
-        let mut out = vec![0.0f32; n];
+        let mut out = self.buf(n);
         for i in 0..n {
             out[i] = self.val[a][i] - self.val[b][i];
         }
@@ -236,7 +323,7 @@ impl Graph {
         let n = self.val[a].len();
         assert_eq!(n, self.val[b].len(), "mul: shape mismatch");
         assert_eq!(self.shape[a], self.shape[b], "mul: shape mismatch");
-        let mut out = vec![0.0f32; n];
+        let mut out = self.buf(n);
         for i in 0..n {
             out[i] = self.val[a][i] * self.val[b][i];
         }
@@ -247,7 +334,7 @@ impl Graph {
 
     pub fn scale(&mut self, a: Nid, k: f32) -> Nid {
         let n = self.val[a].len();
-        let mut out = vec![0.0f32; n];
+        let mut out = self.buf(n);
         for i in 0..n {
             out[i] = self.val[a][i] * k;
         }
@@ -259,7 +346,7 @@ impl Graph {
     /// 1 - x, the complement gate of the recurrence.
     pub fn one_minus(&mut self, a: Nid) -> Nid {
         let n = self.val[a].len();
-        let mut out = vec![0.0f32; n];
+        let mut out = self.buf(n);
         for i in 0..n {
             out[i] = 1.0 - self.val[a][i];
         }
@@ -275,7 +362,7 @@ impl Graph {
         assert_eq!(self.shape[bias], vec![d], "add_row: bias must be one-dimensional");
         assert_eq!(self.shape[x].last().copied(), Some(d), "add_row: trailing dimension mismatch");
         let rows = n / d;
-        let mut out = vec![0.0f32; n];
+        let mut out = self.buf(n);
         for i in 0..rows {
             for j in 0..d {
                 out[i * d + j] = self.val[x][i * d + j] + self.val[bias][j];
@@ -293,7 +380,7 @@ impl Graph {
         assert_eq!(self.shape[gain], vec![d], "mul_row: gain must be one-dimensional");
         assert_eq!(self.shape[x].last().copied(), Some(d), "mul_row: trailing dimension mismatch");
         let rows = n / d;
-        let mut out = vec![0.0f32; n];
+        let mut out = self.buf(n);
         for i in 0..rows {
             for j in 0..d {
                 out[i * d + j] = self.val[x][i * d + j] * self.val[gain][j];
@@ -305,7 +392,7 @@ impl Graph {
     }
 
     pub fn matmul_nn(&mut self, a: Nid, b: Nid, m: usize, k: usize, n: usize) -> Nid {
-        let mut out = vec![0.0f32; checked_2(m, n, "matrix product")];
+        let mut out = self.buf(checked_2(m, n, "matrix product"));
         gemm_nn(&self.val[a], &self.val[b], &mut out, m, k, n, self.threads);
         let req = self.req[a] || self.req[b];
         self.push(vec![m, n], out, Op::MatMulNN(a, b, m, k, n), req)
@@ -313,7 +400,7 @@ impl Graph {
 
     /// x[m,k] @ w[n,k]^T -> [m,n]. Weights are stored [out,in].
     pub fn matmul_nt(&mut self, x: Nid, w: Nid, m: usize, k: usize, n: usize) -> Nid {
-        let mut out = vec![0.0f32; checked_2(m, n, "matrix product")];
+        let mut out = self.buf(checked_2(m, n, "matrix product"));
         gemm_nt(&self.val[x], &self.val[w], &mut out, m, k, n, self.threads);
         let req = self.req[x] || self.req[w];
         self.push(vec![m, n], out, Op::MatMulNT(x, w, m, k, n), req)
@@ -321,7 +408,7 @@ impl Graph {
 
     pub fn silu(&mut self, x: Nid) -> Nid {
         let n = self.val[x].len();
-        let mut out = vec![0.0f32; n];
+        let mut out = self.buf(n);
         for i in 0..n {
             let v = self.val[x][i];
             out[i] = v * sigmoid(v);
@@ -333,10 +420,10 @@ impl Graph {
 
     pub fn gelu(&mut self, x: Nid) -> Nid {
         let n = self.val[x].len();
-        let mut out = vec![0.0f32; n];
+        let mut out = self.buf(n);
         for i in 0..n {
             let v = self.val[x][i];
-            let u = 0.797_884_56f32 * (v + 0.044_715 * v * v * v);
+            let u = SQRT_2_OVER_PI * (v + GELU_CUBIC * v * v * v);
             out[i] = 0.5 * v * (1.0 + u.tanh());
         }
         let req = self.req[x];
@@ -346,7 +433,7 @@ impl Graph {
 
     pub fn sigmoid(&mut self, x: Nid) -> Nid {
         let n = self.val[x].len();
-        let mut out = vec![0.0f32; n];
+        let mut out = self.buf(n);
         for i in 0..n {
             out[i] = sigmoid(self.val[x][i]);
         }
@@ -357,7 +444,7 @@ impl Graph {
 
     pub fn tanh(&mut self, x: Nid) -> Nid {
         let n = self.val[x].len();
-        let mut out = vec![0.0f32; n];
+        let mut out = self.buf(n);
         for i in 0..n {
             out[i] = self.val[x][i].tanh();
         }
@@ -373,8 +460,8 @@ impl Graph {
         assert!(eps.is_finite() && eps > 0.0, "rms_norm: epsilon must be finite and positive");
         let n = checked_2(rows, d, "RMSNorm");
         assert_eq!(self.val[x].len(), n, "rms_norm: bad shape");
-        let mut out = vec![0.0f32; n];
-        let mut scale = vec![0.0f32; rows];
+        let mut out = self.buf(n);
+        let mut scale = self.buf(rows);
         for i in 0..rows {
             let mut ms = 0.0f32;
             for j in 0..d {
@@ -402,7 +489,7 @@ impl Graph {
         assert!(end <= dtot, "slice_cols: out of range");
         assert_eq!(self.val[x].len(), checked_2(rows, dtot, "column slice input"), "slice_cols: bad input shape");
         let out_len = checked_2(rows, len, "column slice output");
-        let mut out = vec![0.0f32; out_len];
+        let mut out = self.buf(out_len);
         for i in 0..rows {
             for j in 0..len {
                 out[i * len + j] = self.val[x][i * dtot + off + j];
@@ -417,7 +504,7 @@ impl Graph {
         assert_eq!(self.val[table].len() % d, 0, "embed: table shape mismatch");
         let rows = ids.len();
         let vocab = self.val[table].len() / d;
-        let mut out = vec![0.0f32; checked_2(rows, d, "embedding output")];
+        let mut out = self.buf(checked_2(rows, d, "embedding output"));
         for i in 0..rows {
             let t = ids[i] as usize;
             assert!(t < vocab, "embed: token out of range");
@@ -437,14 +524,24 @@ impl Graph {
         let rows = checked_2(batch, t, "scan rows");
         assert_eq!(self.val[a].len(), n, "scan: bad a");
         assert_eq!(self.val[b].len(), n, "scan: bad b");
-        let mut h = vec![0.0f32; n];
-        if self.scan_parallel {
-            scan_log_depth(&self.val[a], &self.val[b], &mut h, batch, t, d, self.threads);
+        let mut h = self.buf(n);
+        if self.chunked_scan_wanted(batch, t, d) {
+            scan_chunked(&self.val[a], &self.val[b], &mut h, batch, t, d, self.threads);
         } else {
             scan_sequential(&self.val[a], &self.val[b], &mut h, batch, t, d, self.threads);
         }
         let req = self.req[a] || self.req[b];
         self.push(vec![rows, d], h, Op::Scan(a, b, batch, t, d), req)
+    }
+
+    /// Chunking pays only when the batch axis cannot fill the cores and the
+    /// sequence is long enough to amortise the extra pass over `a`.
+    fn chunked_scan_wanted(&self, batch: usize, t: usize, d: usize) -> bool {
+        match self.scan_policy {
+            ScanPolicy::Sequential => false,
+            ScanPolicy::Chunked => true,
+            ScanPolicy::Auto => self.threads > 1 && batch * 2 <= self.threads && t >= 512 && batch * t * d >= 1 << 16,
+        }
     }
 
     /// Depthwise causal 1-D convolution: y[b,t,j] = bias[j] + sum_q w[q,j] x[b,t-q,j].
@@ -458,14 +555,12 @@ impl Graph {
         assert_eq!(self.val[x].len(), n, "dwconv: bad x");
         assert_eq!(self.val[w].len(), checked_2(k, d, "depthwise convolution weights"), "dwconv: bad w");
         assert_eq!(self.val[bias].len(), d, "dwconv: bad bias");
-        let mut out = vec![0.0f32; n];
+        let mut out = self.buf(n);
         for bi in 0..batch {
             let base = bi * t * d;
             for ti in 0..t {
                 let o = base + ti * d;
-                for j in 0..d {
-                    out[o + j] = self.val[bias][j];
-                }
+                out[o..o + d].copy_from_slice(&self.val[bias][..d]);
                 let qmax = if ti + 1 < k { ti + 1 } else { k };
                 for q in 0..qmax {
                     let src = base + (ti - q) * d;
@@ -486,7 +581,7 @@ impl Graph {
         let elements = checked_2(rows, vocab, "softmax cross-entropy");
         assert_eq!(self.val[logits].len(), elements, "softmax_ce: bad logits");
         assert_eq!(targets.len(), rows, "softmax_ce: bad targets");
-        let mut probs = vec![0.0f32; elements];
+        let mut probs = self.buf(elements);
         let mut loss = 0.0f64;
         let mut cnt = 0usize;
         for i in 0..rows {
@@ -534,7 +629,7 @@ impl Graph {
         let elements = checked_2(rows, k, "distribution cross-entropy");
         assert_eq!(self.val[logits].len(), elements, "soft_ce: bad logits");
         assert_eq!(target.len(), elements, "soft_ce: bad target");
-        let mut probs = vec![0.0f32; elements];
+        let mut probs = self.buf(elements);
         let mut loss = 0.0f64;
         for i in 0..rows {
             let mut mx = f32::NEG_INFINITY;
@@ -607,34 +702,6 @@ impl Graph {
     }
 }
 
-#[cfg(test)]
-mod invariant_tests {
-    use super::*;
-
-    #[test]
-    #[should_panic(expected = "call Graph::seal_params")]
-    fn reset_requires_a_sealed_parameter_prefix() {
-        let mut graph = Graph::new(1);
-        let _ = graph.param("weight", vec![1], vec![0.0], true);
-        graph.reset();
-    }
-
-    #[test]
-    #[should_panic(expected = "cannot add parameters")]
-    fn parameters_cannot_be_added_after_sealing() {
-        let mut graph = Graph::new(1);
-        graph.seal_params();
-        let _ = graph.param("late", vec![1], vec![0.0], true);
-    }
-
-    #[test]
-    #[should_panic(expected = "tensor shape does not match")]
-    fn leaf_shape_must_match_value_count() {
-        let mut graph = Graph::new(1);
-        let _ = graph.input(vec![2, 2], vec![0.0; 3]);
-    }
-}
-
 // ================= reverse pass =================
 
 impl Graph {
@@ -654,7 +721,9 @@ impl Graph {
             if self.req[i] {
                 let n = self.val[i].len();
                 if self.grad[i].len() != n {
-                    self.grad[i] = vec![0.0f32; n];
+                    let buffer = self.buf_zeroed(n);
+                    let stale = std::mem::replace(&mut self.grad[i], buffer);
+                    self.recycle(stale);
                 }
             }
         }
@@ -798,21 +867,23 @@ impl Graph {
                     let go = std::mem::take(&mut self.grad[id]);
                     if self.req[a] {
                         // dA = dC @ B^T
-                        let mut t = vec![0.0f32; checked_2(m, k, "MatMulNN input gradient")];
+                        let mut t = self.buf(checked_2(m, k, "MatMulNN input gradient"));
                         gemm_nt(&go, &self.val[b], &mut t, m, n, k, self.threads);
                         let g = &mut self.grad[a];
                         for i in 0..t.len() {
                             g[i] += t[i];
                         }
+                        self.recycle(t);
                     }
                     if self.req[b] {
                         // dB = A^T @ dC
-                        let mut t = vec![0.0f32; checked_2(k, n, "MatMulNN weight gradient")];
+                        let mut t = self.buf(checked_2(k, n, "MatMulNN weight gradient"));
                         gemm_tn(&self.val[a], &go, &mut t, m, k, n, self.threads);
                         let g = &mut self.grad[b];
                         for i in 0..t.len() {
                             g[i] += t[i];
                         }
+                        self.recycle(t);
                     }
                     self.grad[id] = go;
                 }
@@ -821,21 +892,23 @@ impl Graph {
                     let go = std::mem::take(&mut self.grad[id]);
                     if self.req[x] {
                         // dX = dY @ W
-                        let mut t = vec![0.0f32; checked_2(m, k, "MatMulNT input gradient")];
+                        let mut t = self.buf(checked_2(m, k, "MatMulNT input gradient"));
                         gemm_nn(&go, &self.val[w], &mut t, m, n, k, self.threads);
                         let g = &mut self.grad[x];
                         for i in 0..t.len() {
                             g[i] += t[i];
                         }
+                        self.recycle(t);
                     }
                     if self.req[w] {
                         // dW = dY^T @ X
-                        let mut t = vec![0.0f32; checked_2(n, k, "MatMulNT weight gradient")];
+                        let mut t = self.buf(checked_2(n, k, "MatMulNT weight gradient"));
                         gemm_tn(&go, &self.val[x], &mut t, m, n, k, self.threads);
                         let g = &mut self.grad[w];
                         for i in 0..t.len() {
                             g[i] += t[i];
                         }
+                        self.recycle(t);
                     }
                     self.grad[id] = go;
                 }
@@ -858,12 +931,12 @@ impl Graph {
                     if self.req[x] {
                         let v = &self.val[x];
                         let g = &mut self.grad[x];
-                        let c = 0.797_884_56f32;
+                        let c = SQRT_2_OVER_PI;
                         for i in 0..go.len() {
                             let z = v[i];
-                            let u = c * (z + 0.044_715 * z * z * z);
+                            let u = c * (z + GELU_CUBIC * z * z * z);
                             let th = u.tanh();
-                            let du = c * (1.0 + 3.0 * 0.044_715 * z * z);
+                            let du = c * (1.0 + 3.0 * GELU_CUBIC * z * z);
                             g[i] += go[i] * (0.5 * (1.0 + th) + 0.5 * z * (1.0 - th * th) * du);
                         }
                     }
@@ -948,7 +1021,7 @@ impl Graph {
                 Op::Scan(a, b, batch, t, d) => {
                     let go = std::mem::take(&mut self.grad[id]);
                     let n = checked_3(batch, t, d, "scan adjoint");
-                    let mut c = vec![0.0f32; n];
+                    let mut c = self.buf_zeroed(n);
                     scan_adjoint(&self.val[a], &go, &mut c, batch, t, d);
                     if self.req[b] {
                         let g = &mut self.grad[b];
@@ -1134,10 +1207,58 @@ impl Graph {
     pub fn param_count(&self) -> usize {
         let mut n = 0usize;
         for p in 0..self.params.len() {
-            n = n
-                .checked_add(self.val[self.params[p].id].len())
-                .expect("parameter count overflow");
+            n = n.checked_add(self.val[self.params[p].id].len()).expect("parameter count overflow");
         }
         n
+    }
+}
+
+#[cfg(test)]
+mod invariant_tests {
+    use super::*;
+
+    #[test]
+    #[should_panic(expected = "call Graph::seal_params")]
+    fn reset_requires_a_sealed_parameter_prefix() {
+        let mut graph = Graph::new(1);
+        let _ = graph.param("weight", vec![1], vec![0.0], true);
+        graph.reset();
+    }
+
+    #[test]
+    #[should_panic(expected = "cannot add parameters")]
+    fn parameters_cannot_be_added_after_sealing() {
+        let mut graph = Graph::new(1);
+        graph.seal_params();
+        let _ = graph.param("late", vec![1], vec![0.0], true);
+    }
+
+    #[test]
+    fn activations_are_recycled_between_steps() {
+        let mut graph = Graph::new(1);
+        let weight = graph.param("w", vec![64], vec![0.5f32; 64], true);
+        graph.seal_params();
+        let mut allocations = Vec::new();
+        for _ in 0..4 {
+            graph.reset();
+            graph.zero_grad();
+            let activated = graph.silu(weight);
+            let squared = graph.mul(activated, activated);
+            let scaled = graph.scale(squared, 0.5);
+            let loss = graph.sum(scaled);
+            graph.backward(loss);
+            allocations.push(graph.allocation_count());
+        }
+        assert!(allocations[0] > 0, "the first step has to allocate");
+        assert_eq!(allocations[1], allocations[3], "steady-state steps must reuse pooled buffers ({:?})", allocations);
+        graph.reset();
+        assert!(graph.pooled_buffers() > 0, "reset must park activations in the pool instead of freeing them");
+    }
+
+    #[test]
+    #[should_panic(expected = "tensor shape does not match")]
+    fn leaf_shape_must_match_value_count() {
+        let mut graph = Graph::new(1);
+        let _ = graph.input(vec![2, 2], vec![0.0; 3]);
     }
 }

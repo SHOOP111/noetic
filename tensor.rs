@@ -290,7 +290,7 @@ pub fn silu(x: f32) -> f32 {
 #[inline]
 pub fn gelu(x: f32) -> f32 {
     // tanh approximation, matches the autodiff op exactly
-    let c = 0.797_884_56f32;
+    let c = 0.797_884_6f32;
     let u = c * (x + 0.044_715 * x * x * x);
     0.5 * x * (1.0 + u.tanh())
 }
@@ -362,13 +362,6 @@ pub fn argmax(x: &[f32]) -> usize {
         }
     }
     best
-}
-
-pub fn add_into(dst: &mut [f32], src: &[f32]) {
-    assert_eq!(dst.len(), src.len(), "add_into: length mismatch");
-    for i in 0..dst.len() {
-        dst[i] += src[i];
-    }
 }
 
 #[cfg(test)]

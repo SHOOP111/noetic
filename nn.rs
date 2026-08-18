@@ -34,11 +34,7 @@ impl Linear {
         let elements = dout.checked_mul(din).expect("linear weight size overflow");
         let w = fill_normal(rng, elements, std);
         let wid = g.param(&format!("{}.w", name), vec![dout, din], w, true);
-        let bid = if bias {
-            Some(g.param(&format!("{}.b", name), vec![dout], vec![0.0f32; dout], false))
-        } else {
-            None
-        };
+        let bid = if bias { Some(g.param(&format!("{}.b", name), vec![dout], vec![0.0f32; dout], false)) } else { None };
         Linear { w: wid, b: bid, din, dout }
     }
 

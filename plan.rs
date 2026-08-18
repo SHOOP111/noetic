@@ -77,9 +77,7 @@ impl Puzzle {
             return -STEP_COST;
         }
         let t = self.target_of(a);
-        let tmp = self.tiles[t];
-        self.tiles[t] = self.tiles[self.blank];
-        self.tiles[self.blank] = tmp;
+        self.tiles.swap(t, self.blank);
         self.blank = t;
         if self.is_solved() {
             1.0 - STEP_COST
@@ -145,8 +143,8 @@ impl Puzzle {
             }
             let (pr, pc) = (p / 3, p % 3);
             let (tr, tc) = (t / 3, t % 3);
-            let dr = if pr > tr { pr - tr } else { tr - pr };
-            let dc = if pc > tc { pc - tc } else { tc - pc };
+            let dr = pr.abs_diff(tr);
+            let dc = pc.abs_diff(tc);
             d += dr + dc;
         }
         d
@@ -198,12 +196,7 @@ struct EvalScratch {
 
 impl EvalScratch {
     fn new(hidden: usize) -> EvalScratch {
-        EvalScratch {
-            h1: vec![0.0; hidden],
-            h2: vec![0.0; hidden],
-            policy: [0.0; N_ACT],
-            value: [0.0; 1],
-        }
+        EvalScratch { h1: vec![0.0; hidden], h2: vec![0.0; hidden], policy: [0.0; N_ACT], value: [0.0; 1] }
     }
 }
 
@@ -228,57 +221,21 @@ impl PvNet {
         assert_eq!(scratch.h1.len(), self.hidden, "policy/value scratch has the wrong width");
         assert_eq!(scratch.h2.len(), self.hidden, "policy/value scratch has the wrong width");
         let th = 1;
-        let b1 = match self.l1.b {
-            Some(b) => Some(&g.val[b][..]),
-            None => None,
-        };
+        let b1 = self.l1.b.map(|b| &g.val[b][..]);
         matvec_nt(&g.val[self.l1.w], b1, feat, &mut scratch.h1, self.hidden, FEAT, th);
         for i in 0..self.hidden {
             scratch.h1[i] = silu(scratch.h1[i]);
         }
-        let b2 = match self.l2.b {
-            Some(b) => Some(&g.val[b][..]),
-            None => None,
-        };
-        matvec_nt(
-            &g.val[self.l2.w],
-            b2,
-            &scratch.h1,
-            &mut scratch.h2,
-            self.hidden,
-            self.hidden,
-            th,
-        );
+        let b2 = self.l2.b.map(|b| &g.val[b][..]);
+        matvec_nt(&g.val[self.l2.w], b2, &scratch.h1, &mut scratch.h2, self.hidden, self.hidden, th);
         for i in 0..self.hidden {
             scratch.h2[i] = silu(scratch.h2[i]) + scratch.h1[i];
         }
-        let bp = match self.ph.b {
-            Some(b) => Some(&g.val[b][..]),
-            None => None,
-        };
-        matvec_nt(
-            &g.val[self.ph.w],
-            bp,
-            &scratch.h2,
-            &mut scratch.policy,
-            N_ACT,
-            self.hidden,
-            th,
-        );
+        let bp = self.ph.b.map(|b| &g.val[b][..]);
+        matvec_nt(&g.val[self.ph.w], bp, &scratch.h2, &mut scratch.policy, N_ACT, self.hidden, th);
         softmax_inplace(&mut scratch.policy);
-        let bv = match self.vh.b {
-            Some(b) => Some(&g.val[b][..]),
-            None => None,
-        };
-        matvec_nt(
-            &g.val[self.vh.w],
-            bv,
-            &scratch.h2,
-            &mut scratch.value,
-            1,
-            self.hidden,
-            th,
-        );
+        let bv = self.vh.b.map(|b| &g.val[b][..]);
+        matvec_nt(&g.val[self.vh.w], bv, &scratch.h2, &mut scratch.value, 1, self.hidden, th);
         (scratch.policy, scratch.value[0].tanh())
     }
 
@@ -323,6 +280,12 @@ pub struct Mcts {
     pub evals: u64,
 }
 
+impl Default for Mcts {
+    fn default() -> Mcts {
+        Mcts::new()
+    }
+}
+
 impl Mcts {
     pub fn new() -> Mcts {
         Mcts { nodes: Vec::new(), c_puct: 1.6, gamma: 0.99, max_depth: 48, evals: 0 }
@@ -332,14 +295,7 @@ impl Mcts {
         self.nodes.len()
     }
 
-    fn expand(
-        &mut self,
-        env: &Puzzle,
-        net: &PvNet,
-        g: &Graph,
-        feat: &mut [f32],
-        scratch: &mut EvalScratch,
-    ) -> usize {
+    fn expand(&mut self, env: &Puzzle, net: &PvNet, g: &Graph, feat: &mut [f32], scratch: &mut EvalScratch) -> usize {
         env.features(feat);
         let (p, v) = net.eval_one_with_scratch(g, feat, scratch);
         self.evals = self.evals.checked_add(1).expect("MCTS evaluation counter overflow");
@@ -505,13 +461,8 @@ impl Mcts {
                 let reward = path[i].2;
                 value = reward + self.gamma * value;
                 self.nodes[node].w[action] += value;
-                self.nodes[node].n[action] = self.nodes[node].n[action]
-                    .checked_add(1)
-                    .expect("MCTS edge visit count overflow");
-                self.nodes[node].visits = self.nodes[node]
-                    .visits
-                    .checked_add(1)
-                    .expect("MCTS node visit count overflow");
+                self.nodes[node].n[action] = self.nodes[node].n[action].checked_add(1).expect("MCTS edge visit count overflow");
+                self.nodes[node].visits = self.nodes[node].visits.checked_add(1).expect("MCTS node visit count overflow");
             }
         }
 
@@ -525,14 +476,6 @@ impl Mcts {
             out = self.nodes[r].prior;
         }
         out
-    }
-
-    pub fn root_value(&self) -> f32 {
-        if self.nodes.is_empty() {
-            0.0
-        } else {
-            self.nodes[0].value
-        }
     }
 }
 
@@ -571,6 +514,62 @@ pub struct TrainStats {
     pub avg_len: f32,
     pub samples: usize,
     pub evals: u64,
+    pub buffered: usize,
+}
+
+/// Fixed-capacity FIFO of self-play targets.
+///
+/// Training one pass over freshly generated games and then throwing them away
+/// wastes almost all of the search effort - the previous version of this loop
+/// did exactly that, and its policy never got good enough to solve a board
+/// without search. Reusing the last `capacity` positions across iterations is
+/// the standard fix.
+pub struct ReplayBuffer {
+    pub capacity: usize,
+    features: Vec<f32>,
+    policies: Vec<f32>,
+    values: Vec<f32>,
+    next: usize,
+    len: usize,
+}
+
+impl ReplayBuffer {
+    pub fn new(capacity: usize) -> ReplayBuffer {
+        let capacity = capacity.max(1);
+        ReplayBuffer {
+            capacity,
+            features: vec![0.0; capacity * FEAT],
+            policies: vec![0.0; capacity * N_ACT],
+            values: vec![0.0; capacity],
+            next: 0,
+            len: 0,
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    pub fn push(&mut self, feature: &[f32], policy: &[f32], value: f32) {
+        assert_eq!(feature.len(), FEAT, "replay feature has the wrong width");
+        assert_eq!(policy.len(), N_ACT, "replay policy has the wrong width");
+        let slot = self.next;
+        self.features[slot * FEAT..(slot + 1) * FEAT].copy_from_slice(feature);
+        self.policies[slot * N_ACT..(slot + 1) * N_ACT].copy_from_slice(policy);
+        self.values[slot] = value;
+        self.next = (slot + 1) % self.capacity;
+        self.len = (self.len + 1).min(self.capacity);
+    }
+
+    fn write_row(&self, source: usize, row: usize, xb: &mut [f32], pb: &mut [f32], vb: &mut [f32]) {
+        xb[row * FEAT..(row + 1) * FEAT].copy_from_slice(&self.features[source * FEAT..(source + 1) * FEAT]);
+        pb[row * N_ACT..(row + 1) * N_ACT].copy_from_slice(&self.policies[source * N_ACT..(source + 1) * N_ACT]);
+        vb[row] = self.values[source];
+    }
 }
 
 /// One self-play + learn cycle.
@@ -582,11 +581,13 @@ pub struct TrainStats {
 ///
 /// Training on your own search output is what makes this self-improving: no
 /// human games, no labels, no external model.
+#[allow(clippy::too_many_arguments)]
 pub fn selfplay_iteration(
     g: &mut Graph,
     net: &PvNet,
     opt: &mut AdamW,
     rng: &mut Rng,
+    replay: &mut ReplayBuffer,
     games: usize,
     sims: usize,
     scramble: usize,
@@ -594,13 +595,12 @@ pub fn selfplay_iteration(
     lr: f32,
     max_steps: usize,
     temp_moves: usize,
+    epochs: usize,
 ) -> TrainStats {
     assert!(batch > 0, "self-play training batch must be positive");
     assert!(lr.is_finite() && lr >= 0.0, "self-play learning rate must be finite and non-negative");
     let gamma = 0.99f32;
-    let mut feats: Vec<f32> = Vec::new();
-    let mut pols: Vec<f32> = Vec::new();
-    let mut vals: Vec<f32> = Vec::new();
+    let mut fresh_rows = 0usize;
     let mut solved_n = 0usize;
     let mut len_sum = 0usize;
     let mut mcts = Mcts::new();
@@ -652,55 +652,45 @@ pub fn selfplay_iteration(
         while i > 0 {
             i -= 1;
             acc = rewards[i] + gamma * acc;
-            ret[i] = if acc > 1.0 {
-                1.0
-            } else if acc < -1.0 {
-                -1.0
-            } else {
-                acc
-            };
+            ret[i] = acc.clamp(-1.0, 1.0);
         }
-        feats.extend_from_slice(&g_feats);
-        pols.extend_from_slice(&g_pols);
-        vals.extend_from_slice(&ret);
+        fresh_rows += n;
+        for row in 0..n {
+            replay.push(&g_feats[row * FEAT..(row + 1) * FEAT], &g_pols[row * N_ACT..(row + 1) * N_ACT], ret[row]);
+        }
     }
 
-    // ---- supervised fit on the freshly generated targets ----
-    let rows_total = vals.len();
+    // ---- supervised fit over the replay buffer, not just this iteration ----
+    let rows_total = replay.len();
     let mut weighted_loss = 0.0f64;
     let mut trained_rows = 0usize;
     if rows_total > 0 {
         let mut idx: Vec<usize> = (0..rows_total).collect();
-        rng.shuffle_usize(&mut idx);
-        let mut off = 0usize;
-        while off < rows_total {
-            let rows = batch.min(rows_total - off);
-            g.reset();
-            let mut xb = vec![0.0f32; rows.checked_mul(FEAT).expect("feature minibatch size overflow")];
-            let mut pb = vec![0.0f32; rows.checked_mul(N_ACT).expect("policy minibatch size overflow")];
-            let mut vb = vec![0.0f32; rows];
-            for b in 0..rows {
-                let s = idx[off + b];
-                for j in 0..FEAT {
-                    xb[b * FEAT + j] = feats[s * FEAT + j];
+        let mut xb = vec![0.0f32; batch.checked_mul(FEAT).expect("feature minibatch size overflow")];
+        let mut pb = vec![0.0f32; batch.checked_mul(N_ACT).expect("policy minibatch size overflow")];
+        let mut vb = vec![0.0f32; batch];
+        for _ in 0..epochs.max(1) {
+            rng.shuffle_usize(&mut idx);
+            let mut off = 0usize;
+            while off < rows_total {
+                let rows = batch.min(rows_total - off);
+                g.reset();
+                for b in 0..rows {
+                    replay.write_row(idx[off + b], b, &mut xb, &mut pb, &mut vb);
                 }
-                for j in 0..N_ACT {
-                    pb[b * N_ACT + j] = pols[s * N_ACT + j];
-                }
-                vb[b] = vals[s];
+                let x = g.input(vec![rows, FEAT], xb[..rows * FEAT].to_vec());
+                let (logits, v) = net.heads(g, x, rows);
+                let lp = g.soft_ce(logits, rows, N_ACT, &pb[..rows * N_ACT]);
+                let lv = g.mse(v, &vb[..rows]);
+                let loss = g.add(lp, lv);
+                g.zero_grad();
+                g.backward(loss);
+                g.clip_grad_norm(1.0);
+                opt.step(g, lr);
+                weighted_loss += (g.scalar(loss) as f64) * (rows as f64);
+                off += rows;
+                trained_rows += rows;
             }
-            let x = g.input(vec![rows, FEAT], xb);
-            let (logits, v) = net.heads(g, x, rows);
-            let lp = g.soft_ce(logits, rows, N_ACT, &pb);
-            let lv = g.mse(v, &vb);
-            let loss = g.add(lp, lv);
-            g.zero_grad();
-            g.backward(loss);
-            g.clip_grad_norm(1.0);
-            opt.step(g, lr);
-            weighted_loss += (g.scalar(loss) as f64) * (rows as f64);
-            off += rows;
-            trained_rows += rows;
         }
         g.reset();
     }
@@ -709,7 +699,103 @@ pub fn selfplay_iteration(
         loss: if trained_rows > 0 { (weighted_loss / (trained_rows as f64)) as f32 } else { 0.0 },
         solve_rate: if games > 0 { (solved_n as f32) / (games as f32) } else { 0.0 },
         avg_len: if games > 0 { (len_sum as f32) / (games as f32) } else { 0.0 },
-        samples: rows_total,
+        samples: fresh_rows,
         evals: mcts.evals,
+        buffered: replay.len(),
+    }
+}
+
+/// Fraction of freshly scrambled boards solved by greedy search play. Used as
+/// the acceptance gate for a self-play iteration.
+pub fn evaluate_solver(
+    net: &PvNet,
+    g: &Graph,
+    rng: &mut Rng,
+    boards: usize,
+    scramble: usize,
+    sims: usize,
+    max_steps: usize,
+) -> f32 {
+    if boards == 0 {
+        return 0.0;
+    }
+    let mut solved = 0usize;
+    for _ in 0..boards {
+        let mut env = Puzzle::solved();
+        env.scramble(scramble, rng);
+        let (ok, _, _) = solve(&env, net, g, rng, sims, max_steps);
+        if ok {
+            solved += 1;
+        }
+    }
+    (solved as f32) / (boards as f32)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn replay_buffer_evicts_oldest_first() {
+        let mut replay = ReplayBuffer::new(3);
+        assert!(replay.is_empty());
+        for i in 0..5u32 {
+            let feature = vec![i as f32; FEAT];
+            let policy = vec![1.0 / (N_ACT as f32); N_ACT];
+            replay.push(&feature, &policy, i as f32);
+        }
+        assert_eq!(replay.len(), 3, "buffer grew past its capacity");
+
+        // The three survivors must be the newest three, in some order.
+        let mut seen = Vec::new();
+        let mut xb = vec![0.0f32; FEAT];
+        let mut pb = vec![0.0f32; N_ACT];
+        let mut vb = vec![0.0f32; 1];
+        for slot in 0..replay.len() {
+            replay.write_row(slot, 0, &mut xb, &mut pb, &mut vb);
+            assert_eq!(xb[0], vb[0], "feature and value rows fell out of sync");
+            for value in &pb {
+                assert!((value - 1.0 / (N_ACT as f32)).abs() < 1e-6);
+            }
+            seen.push(vb[0] as i32);
+        }
+        seen.sort_unstable();
+        assert_eq!(seen, vec![2, 3, 4]);
+    }
+
+    /// Search with an *untrained* net leans entirely on terminal rewards, so it
+    /// only reaches shallow goals. Measured on this arena (400 simulations, 12
+    /// seeds): scrambles of 1-4 moves solve 12/12, 6 moves solves 5/12, 8 moves
+    /// solves 0/12. The test asserts the reliable end of that range, which is
+    /// enough to catch broken terminal detection, backup, or move replay.
+    #[test]
+    fn shallow_boards_are_solved_by_search_alone() {
+        for seed in 0..4u64 {
+            let mut rng = Rng::new(seed + 1);
+            let mut g = Graph::new(1);
+            let net = PvNet::new(&mut g, &mut rng, 32);
+            g.seal_params();
+            let mut env = Puzzle::solved();
+            env.scramble(4, &mut rng);
+            let (solved, moves, nodes) = solve(&env, &net, &g, &mut rng, 400, 40);
+            assert!(solved, "search failed on a 4-move scramble (seed {}, {} nodes)", seed, nodes);
+            let mut replay = env;
+            for action in &moves {
+                assert!(replay.legal(*action), "search returned an illegal move");
+                replay.step(*action);
+            }
+            assert!(replay.is_solved(), "replaying the returned moves does not solve the board");
+        }
+    }
+
+    #[test]
+    fn evaluate_solver_reports_a_fraction() {
+        let mut rng = Rng::new(11);
+        let mut g = Graph::new(1);
+        let net = PvNet::new(&mut g, &mut rng, 32);
+        g.seal_params();
+        let rate = evaluate_solver(&net, &g, &mut rng, 4, 4, 64, 30);
+        assert!((0.0..=1.0).contains(&rate), "solve rate {} is not a fraction", rate);
+        assert_eq!(evaluate_solver(&net, &g, &mut rng, 0, 4, 64, 30), 0.0);
     }
 }

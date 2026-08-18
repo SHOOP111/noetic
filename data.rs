@@ -4,24 +4,20 @@
 //! The synthetic corpus deliberately mixes four skills so training curves are
 //! informative rather than decorative:
 //!
-//! 1. grammar     - a small PCFG; tests local syntax
-//! 2. arithmetic  - `a + b = c`; tests exact computation
-//! 3. memo/query  - `memo <key> = <val> ... query <key> = <val>`; only solvable
-//!                  by carrying information across many tokens, i.e. it
-//!                  directly measures the recurrent state's memory
-//! 4. counting    - ascending runs; tests positional bookkeeping
+//! 1. grammar - a small PCFG; tests local syntax
+//! 2. arithmetic - `a + b = c`; tests exact computation
+//! 3. memo/query - `memo <key> = <val> ... query <key> = <val>`; only solvable by
+//!    carrying information across many tokens, i.e. it directly measures the
+//!    recurrent state's memory
+//! 4. counting - ascending runs; tests positional bookkeeping
 
 use crate::rng::Rng;
 
-const NOUNS: [&str; 12] = [
-    "engine", "kernel", "tensor", "agent", "signal", "lattice", "memory", "circuit", "river", "mountain", "machine", "garden",
-];
-const VERBS: [&str; 10] = [
-    "builds", "observes", "folds", "remembers", "drives", "encodes", "resolves", "shapes", "tracks", "predicts",
-];
-const ADJS: [&str; 10] = [
-    "quiet", "dense", "recursive", "sparse", "bright", "linear", "hidden", "stable", "ancient", "fast",
-];
+const NOUNS: [&str; 12] =
+    ["engine", "kernel", "tensor", "agent", "signal", "lattice", "memory", "circuit", "river", "mountain", "machine", "garden"];
+const VERBS: [&str; 10] =
+    ["builds", "observes", "folds", "remembers", "drives", "encodes", "resolves", "shapes", "tracks", "predicts"];
+const ADJS: [&str; 10] = ["quiet", "dense", "recursive", "sparse", "bright", "linear", "hidden", "stable", "ancient", "fast"];
 const KEYS: [&str; 8] = ["alpha", "beta", "gamma", "delta", "omega", "sigma", "theta", "kappa"];
 
 pub fn synthetic_corpus(target_bytes: usize, seed: u64) -> String {
@@ -74,13 +70,10 @@ pub fn synthetic_corpus(target_bytes: usize, seed: u64) -> String {
 /// Read `path`, or fall back to the synthetic corpus when it is missing/empty.
 pub fn load_or_synthesize(path: &str, bytes: usize, seed: u64) -> (String, bool) {
     if !path.is_empty() {
-        match std::fs::read(path) {
-            Ok(raw) => {
-                if !raw.is_empty() {
-                    return (String::from_utf8_lossy(&raw).to_string(), false);
-                }
+        if let Ok(raw) = std::fs::read(path) {
+            if !raw.is_empty() {
+                return (String::from_utf8_lossy(&raw).to_string(), false);
             }
-            Err(_) => {}
         }
     }
     (synthetic_corpus(bytes, seed), true)
@@ -96,11 +89,7 @@ impl Batcher {
     pub fn new(tokens: Vec<u32>, val_frac: f32) -> Batcher {
         let n = tokens.len();
         assert!(n >= 2, "Batcher requires at least two tokens");
-        let val_frac = if val_frac.is_finite() {
-            val_frac.clamp(0.0, 0.5)
-        } else {
-            0.05
-        };
+        let val_frac = if val_frac.is_finite() { val_frac.clamp(0.0, 0.5) } else { 0.05 };
         let mut split = ((n as f64) * (1.0 - val_frac as f64)) as usize;
         split = split.clamp(2, n);
         if val_frac > 0.0 && n >= 4 {
@@ -114,10 +103,7 @@ impl Batcher {
         assert!(t > 0, "context length must be positive");
         assert!(lo <= hi && hi <= self.tokens.len(), "batch range is out of bounds");
         let available = hi - lo;
-        assert!(
-            available > t,
-            "batch range must contain at least context length + 1 tokens"
-        );
+        assert!(available > t, "batch range must contain at least context length + 1 tokens");
 
         // A crop consumes t + 1 tokens. If the range contains `available`
         // tokens, there are exactly `available - t` valid starting offsets.
