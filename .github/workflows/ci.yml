@@ -16,6 +16,19 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  lint:
+    name: Format and clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Format
+        run: cargo fmt --all --check
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
   build:
     name: Build and test (Rust ${{ matrix.toolchain }})
     runs-on: ubuntu-latest
@@ -107,7 +120,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Verify math
-        run: python3 verify_math.py
+      - uses: dtolnay/rust-toolchain@stable
       - name: Verify source structure
         run: python3 verify_structure.py
+      - name: Build release binary
+        run: cargo build --release
+      - name: Verify the compiled engine end to end
+        run: python3 verify_engine.py target/release/noetic

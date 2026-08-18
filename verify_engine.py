@@ -1,308 +1,182 @@
 #!/usr/bin/env python3
-"""Numeric validation of the math implemented in noetic's autograd/scan.
+"""End-to-end verification of the *compiled* noetic binary.
 
-No Rust toolchain exists in this sandbox, so the *formulas* transcribed from
-src/scan.rs and src/autograd.rs are re-implemented here line-for-line and
-checked against central finite differences and independent references.
+This script used to re-implement every formula from `autograd.rs` and `scan.rs`
+in Python and check those transcriptions against finite differences. That was
+worse than useless: a third parallel implementation of the same math, which
+happily reported "all checks passed" during a period when `cargo test` did not
+even compile. A verifier that cannot fail when the code under test is broken is
+not a verifier.
 
-This validates the derivations; it does not compile the Rust.
+So it now checks the real artifact, and only things Rust cannot check itself:
+
+  1. `selftest` runs clean, and every reported error is inside its tolerance
+     (the tolerances are parsed out of the output, not restated here).
+  2. Thread count does not change results: `--threads 1` and `--threads 4`
+     produce byte-identical output apart from the header line. This is the
+     determinism guarantee, and it is invisible to a single-threaded test.
+  3. `train` improves a held-out loss and writes a resumable checkpoint whose
+     reported nats/token match the printed bits/token (ln 2 conversion).
+  4. `gen --greedy` is reproducible across processes for a fixed seed.
+  5. `bpe` round-trips a corpus losslessly through a saved tokenizer file.
+
+The gradient math itself is checked by `cargo test` (finite differences) and by
+`noetic selftest`, both of which exercise the Rust code that actually ships.
+
+Usage:  python3 verify_math.py [path/to/noetic]
 """
-import math, random
+import math
+import os
+import re
+import subprocess
+import sys
+import tempfile
 
-random.seed(20250816)
-fails = []
+HERE = os.path.dirname(os.path.abspath(__file__))
+failures = []
+checks = 0
 
 
-def report(name, err, tol):
-    ok = err < tol
-    print(f"  [{'PASS' if ok else 'FAIL'}] {name:<44} err {err:.3e}  (tol {tol:.0e})")
+def report(name, ok, detail=""):
+    global checks
+    checks += 1
+    print(f"  [{'PASS' if ok else 'FAIL'}] {name:<44} {detail}")
     if not ok:
-        fails.append(name)
+        failures.append(name)
 
 
-def fd(f, x, i, eps=1e-5):
-    x1 = list(x); x1[i] += eps
-    x2 = list(x); x2[i] -= eps
-    return (f(x1) - f(x2)) / (2 * eps)
+def find_binary():
+    if len(sys.argv) > 1:
+        return sys.argv[1]
+    for candidate in ("target/release/noetic", "target/release/noetic.exe", "target/debug/noetic", "target/debug/noetic.exe"):
+        path = os.path.join(HERE, candidate)
+        if os.path.isfile(path):
+            return path
+    print("no noetic binary found; run `cargo build --release` first")
+    sys.exit(2)
 
 
-def sigmoid(z):
-    return 1.0 / (1.0 + math.exp(-z)) if z >= 0 else math.exp(z) / (1.0 + math.exp(z))
+def run(binary, args, timeout=1800):
+    proc = subprocess.run([binary] + args, cwd=HERE, capture_output=True, text=True, timeout=timeout)
+    return proc.returncode, proc.stdout + proc.stderr
 
 
-# ---------------------------------------------------------------------------
-# 1. sequential recurrence vs double-buffered Hillis-Steele scan (scan.rs)
-# ---------------------------------------------------------------------------
-def scan_sequential(a, b, T, D):
-    h = [0.0] * (T * D)
-    carry = [0.0] * D
-    for t in range(T):
-        for j in range(D):
-            carry[j] = a[t * D + j] * carry[j] + b[t * D + j]
-            h[t * D + j] = carry[j]
-    return h
+NUM = r"[-+]?[0-9]*\.?[0-9]+(?:[eE][-+]?[0-9]+)?"
 
 
-def scan_log_depth(a, b, T, D):
-    sa, sb = list(a), list(b)
-    da, db = [0.0] * (T * D), [0.0] * (T * D)
-    stride = 1
-    while stride < T:
-        for t in range(T):
-            cur = t * D
-            if t >= stride:
-                prev = (t - stride) * D
-                for j in range(D):
-                    db[cur + j] = sa[cur + j] * sb[prev + j] + sb[cur + j]
-                    da[cur + j] = sa[cur + j] * sa[prev + j]
-            else:
-                for j in range(D):
-                    db[cur + j] = sb[cur + j]
-                    da[cur + j] = sa[cur + j]
-        sa, da = da, sa
-        sb, db = db, sb
-        stride <<= 1
-    return sb
+def check_selftest(binary):
+    code, out = run(binary, ["selftest", "--threads", "4"])
+    lines = [line for line in out.splitlines() if line.strip().startswith("[")]
+    report("selftest exits zero", code == 0, f"exit {code}, {len(lines)} checks")
+    failed = [line for line in lines if "[FAIL]" in line]
+    report("every selftest check passes", not failed and len(lines) >= 12, f"{len(lines) - len(failed)}/{len(lines)} passed")
+
+    # Errors must be small in absolute terms too, so a silently loosened
+    # tolerance inside the Rust code cannot hide a regression from this script.
+    limits = [
+        ("gemm", 1e-4),
+        ("chunked vs seq", 1e-6),
+        ("max rel err", 5e-2),
+        ("max logit diff", 1e-5),
+        ("final mse", 1e-3),
+    ]
+    worst = 0.0
+    for line in lines:
+        for needle, limit in limits:
+            if needle in line:
+                # Numbers only from the reported-error segment: a parenthesised
+                # parameter name such as `(blk1.ssm.in_proj.b)` is not a value.
+                segment = line.split(needle, 1)[1].split("(")[0]
+                for value in re.findall(NUM, segment):
+                    magnitude = abs(float(value))
+                    if magnitude > limit:
+                        report(f"reported error within {limit:.0e}", False, line.strip())
+                        return
+                    worst = max(worst, magnitude / limit)
+    report("reported errors inside hard limits", True, f"worst {100.0 * worst:.1f}% of its limit")
 
 
-T, D = 67, 5
-a = [random.uniform(0.01, 0.99) for _ in range(T * D)]
-b = [random.gauss(0, 1) for _ in range(T * D)]
-h1 = scan_sequential(a, b, T, D)
-h2 = scan_log_depth(a, b, T, D)
-report("log-depth scan == sequential recurrence", max(abs(x - y) for x, y in zip(h1, h2)), 1e-9)
+def check_determinism(binary):
+    outputs = []
+    for threads in ("1", "4"):
+        code, out = run(binary, ["selftest", "--threads", threads])
+        if code != 0:
+            report("thread count does not change results", False, f"selftest --threads {threads} exited {code}")
+            return
+        body = [line for line in out.splitlines() if "threads =" not in line]
+        outputs.append("\n".join(body))
+    same = outputs[0] == outputs[1]
+    detail = "byte-identical output" if same else "OUTPUT DIFFERS between 1 and 4 threads"
+    report("thread count does not change results", same, detail)
 
 
-# ---------------------------------------------------------------------------
-# 2. scan adjoint (scan_adjoint + Op::Scan arm) vs finite differences
-#    c_t = g_t + a_{t+1} c_{t+1};  dL/db_t = c_t;  dL/da_t = c_t * h_{t-1}
-# ---------------------------------------------------------------------------
-def scan_adjoint(a, g, T, D):
-    c = [0.0] * (T * D)
-    carry = [0.0] * D
-    for t in range(T - 1, -1, -1):
-        for j in range(D):
-            cv = g[t * D + j] + carry[j]
-            c[t * D + j] = cv
-            carry[j] = a[t * D + j] * cv
-    return c
+def check_training(binary):
+    with tempfile.TemporaryDirectory() as tmp:
+        ckpt = os.path.join(tmp, "v.ckpt")
+        tok = os.path.join(tmp, "v.tok")
+        args = [
+            "train", "--steps", "40", "--d", "64", "--layers", "2", "--ctx", "48", "--batch", "6",
+            "--bytes", "60000", "--vocab", "400", "--valevery", "20", "--n", "16",
+            "--out", ckpt, "--tok", tok,
+        ]
+        code, out = run(binary, args)
+        if code != 0:
+            report("train exits zero", False, f"exit {code}")
+            return
+        report("train exits zero", True, "40 steps")
+
+        vals = [(float(m.group(1)), float(m.group(2))) for m in re.finditer(rf"held-out ({NUM}) nats \(({NUM}) bits", out)]
+        report("training reports held-out loss", len(vals) >= 2, f"{len(vals)} evaluations")
+        if vals:
+            nats, bits = vals[-1]
+            report("nats/bits conversion is consistent", abs(nats / math.log(2) - bits) < 5e-3, f"{nats:.4f} nats = {bits:.3f} bits")
+            report("held-out loss beats a uniform 400-token prior", nats < math.log(400), f"{nats:.4f} < {math.log(400):.4f}")
+        if len(vals) >= 2:
+            report("held-out loss improves over training", vals[-1][0] < vals[0][0], f"{vals[0][0]:.4f} -> {vals[-1][0]:.4f}")
+
+        report("checkpoint written", os.path.isfile(ckpt), f"{os.path.getsize(ckpt) if os.path.isfile(ckpt) else 0} bytes")
+
+        code, out = run(binary, ["train", "--resume", ckpt, "--steps", "10", "--bytes", "60000", "--n", "8", "--out", ckpt])
+        resumed = "restored parameters and AdamW moments" in out
+        report("checkpoint is resumable with optimizer state", code == 0 and resumed, f"exit {code}")
+
+        outs = []
+        for _ in range(2):
+            code, out = run(binary, ["gen", "--ckpt", ckpt, "--prompt", "memo alpha = ", "--n", "24", "--greedy", "--seed", "7"])
+            if code != 0:
+                report("greedy generation is reproducible", False, f"exit {code}")
+                return
+            outs.append(out)
+        report("greedy generation is reproducible", outs[0] == outs[1], "two processes, identical bytes")
 
 
-T, D = 9, 3
-av = [random.uniform(0.05, 0.95) for _ in range(T * D)]
-bv = [random.gauss(0, 1) for _ in range(T * D)]
-w = [random.gauss(0, 1) for _ in range(T * D)]
+def check_tokenizer(binary):
+    with tempfile.TemporaryDirectory() as tmp:
+        corpus = os.path.join(tmp, "corpus.txt")
+        text = "".join(chr(32 + (i * 7919) % 95) for i in range(60000))
+        with open(corpus, "w", encoding="utf-8") as handle:
+            handle.write(text)
+        tok = os.path.join(tmp, "t.tok")
+        code, out = run(binary, ["bpe", "--data", corpus, "--vocab", "600", "--out", tok])
+        lossless = "roundtrip: lossless" in out or "lossless" in out
+        report("bpe round-trips a corpus", code == 0 and lossless, f"exit {code}")
+        report("tokenizer file written", os.path.isfile(tok), f"{os.path.getsize(tok) if os.path.isfile(tok) else 0} bytes")
 
 
-def loss_ab(flat):
-    aa, bb = flat[: T * D], flat[T * D :]
-    h = scan_sequential(aa, bb, T, D)
-    return sum(hi * wi for hi, wi in zip(h, w))
+def main():
+    binary = find_binary()
+    print(f"verifying {binary}")
+    print()
+    check_selftest(binary)
+    check_determinism(binary)
+    check_training(binary)
+    check_tokenizer(binary)
+    print()
+    if failures:
+        print(f"{len(failures)} of {checks} checks FAILED: {', '.join(failures)}")
+        sys.exit(1)
+    print(f"all {checks} end-to-end checks passed")
 
 
-flat = av + bv
-h = scan_sequential(av, bv, T, D)
-c = scan_adjoint(av, w, T, D)
-grad_b = c[:]
-grad_a = [0.0] * (T * D)
-for t in range(1, T):
-    for j in range(D):
-        grad_a[t * D + j] = c[t * D + j] * h[(t - 1) * D + j]
-ana = grad_a + grad_b
-err = max(abs(ana[i] - fd(loss_ab, flat, i)) for i in range(len(flat)))
-report("scan gradient d(a,b) vs finite diff", err, 1e-5)
-
-
-# ---------------------------------------------------------------------------
-# 3. RMSNorm backward (Op::RmsNorm arm)
-#    r = 1/sqrt(mean(x^2)+eps);  y = r*x
-#    dx = r*go - r^3 * dot(go,x)/d * x
-# ---------------------------------------------------------------------------
-d = 7
-eps = 1e-5
-x = [random.gauss(0, 1.7) for _ in range(d)]
-go = [random.gauss(0, 1) for _ in range(d)]
-
-
-def rms_loss(xx):
-    ms = sum(v * v for v in xx) / d + eps
-    r = 1.0 / math.sqrt(ms)
-    return sum(r * xx[j] * go[j] for j in range(d))
-
-
-ms = sum(v * v for v in x) / d + eps
-r = 1.0 / math.sqrt(ms)
-dot = sum(go[j] * x[j] for j in range(d))
-k = r * r * r * dot / d
-ana = [r * go[j] - k * x[j] for j in range(d)]
-err = max(abs(ana[j] - fd(rms_loss, x, j)) for j in range(d))
-report("RMSNorm gradient vs finite diff", err, 1e-5)
-
-
-# ---------------------------------------------------------------------------
-# 4. softmax cross-entropy (Op::SoftmaxCe arm): grad = (p - onehot)/rows
-# ---------------------------------------------------------------------------
-rows, V = 4, 6
-logits = [random.gauss(0, 1) for _ in range(rows * V)]
-targets = [random.randrange(V) for _ in range(rows)]
-
-
-def ce_loss(lg):
-    tot = 0.0
-    for i in range(rows):
-        row = lg[i * V : (i + 1) * V]
-        mx = max(row)
-        s = sum(math.exp(v - mx) for v in row)
-        tot += -(row[targets[i]] - mx - math.log(s))
-    return tot / rows
-
-
-ana = [0.0] * (rows * V)
-for i in range(rows):
-    row = logits[i * V : (i + 1) * V]
-    mx = max(row)
-    ex = [math.exp(v - mx) for v in row]
-    s = sum(ex)
-    for j in range(V):
-        p = ex[j] / s
-        if j == targets[i]:
-            p -= 1.0
-        ana[i * V + j] = p / rows
-err = max(abs(ana[i] - fd(ce_loss, logits, i)) for i in range(rows * V))
-report("softmax-CE gradient vs finite diff", err, 1e-5)
-
-
-# ---------------------------------------------------------------------------
-# 5. distribution-target CE (Op::SoftCeDist arm): grad = (tsum*p - t)/rows
-#    used for MCTS visit-count policy targets
-# ---------------------------------------------------------------------------
-rows, K = 5, 4
-logits = [random.gauss(0, 1) for _ in range(rows * K)]
-tgt = []
-for i in range(rows):
-    raw = [random.random() for _ in range(K)]
-    s = sum(raw)
-    tgt.extend(v / s for v in raw)
-
-
-def soft_ce(lg):
-    tot = 0.0
-    for i in range(rows):
-        row = lg[i * K : (i + 1) * K]
-        mx = max(row)
-        s = sum(math.exp(v - mx) for v in row)
-        for j in range(K):
-            lp = row[j] - mx - math.log(s)
-            tot += -tgt[i * K + j] * lp
-    return tot / rows
-
-
-ana = [0.0] * (rows * K)
-for i in range(rows):
-    row = logits[i * K : (i + 1) * K]
-    mx = max(row)
-    ex = [math.exp(v - mx) for v in row]
-    s = sum(ex)
-    tsum = sum(tgt[i * K : (i + 1) * K])
-    for j in range(K):
-        p = ex[j] / s
-        ana[i * K + j] = (tsum * p - tgt[i * K + j]) / rows
-err = max(abs(ana[i] - fd(soft_ce, logits, i)) for i in range(rows * K))
-report("distribution-target CE gradient", err, 1e-5)
-
-
-# ---------------------------------------------------------------------------
-# 6. causal depthwise conv backward (Op::DwConv arm)
-# ---------------------------------------------------------------------------
-T, D, K = 6, 3, 4
-xv = [random.gauss(0, 1) for _ in range(T * D)]
-wv = [random.gauss(0, 1) for _ in range(K * D)]
-bias = [random.gauss(0, 1) for _ in range(D)]
-go = [random.gauss(0, 1) for _ in range(T * D)]
-
-
-def conv_fwd(xx, ww, bb):
-    out = [0.0] * (T * D)
-    for t in range(T):
-        for j in range(D):
-            s = bb[j]
-            for q in range(min(t + 1, K)):
-                s += ww[q * D + j] * xx[(t - q) * D + j]
-            out[t * D + j] = s
-    return out
-
-
-def conv_loss(flat):
-    xx = flat[: T * D]
-    ww = flat[T * D : T * D + K * D]
-    bb = flat[T * D + K * D :]
-    out = conv_fwd(xx, ww, bb)
-    return sum(o * g for o, g in zip(out, go))
-
-
-gx = [0.0] * (T * D)
-gw = [0.0] * (K * D)
-gb = [0.0] * D
-for t in range(T):
-    for j in range(D):
-        for q in range(min(t + 1, K)):
-            gx[(t - q) * D + j] += go[t * D + j] * wv[q * D + j]
-            gw[q * D + j] += go[t * D + j] * xv[(t - q) * D + j]
-        gb[j] += go[t * D + j]
-ana = gx + gw + gb
-flat = xv + wv + bias
-err = max(abs(ana[i] - fd(conv_loss, flat, i)) for i in range(len(flat)))
-report("depthwise causal conv gradient", err, 1e-5)
-
-
-# ---------------------------------------------------------------------------
-# 7. SiLU derivative: s*(1 + v*(1-s))
-# ---------------------------------------------------------------------------
-err = 0.0
-for _ in range(200):
-    v = random.gauss(0, 3)
-    s = sigmoid(v)
-    ana = s * (1.0 + v * (1.0 - s))
-    num = ((v + 1e-5) * sigmoid(v + 1e-5) - (v - 1e-5) * sigmoid(v - 1e-5)) / 2e-5
-    err = max(err, abs(ana - num))
-report("SiLU derivative", err, 1e-5)
-
-
-# ---------------------------------------------------------------------------
-# 8. decay-spectrum init (model.rs): z = logit(exp(-1/tau)) must reproduce tau
-# ---------------------------------------------------------------------------
-E, tau_max = 256, 128.0
-err = 0.0
-taus = []
-for j in range(E):
-    frac = j / (E - 1)
-    tau = tau_max ** frac
-    aa = math.exp(-1.0 / tau)
-    aa = min(max(aa, 0.001), 0.9999)
-    z = math.log(aa / (1.0 - aa))
-    back = sigmoid(z)
-    err = max(err, abs(back - aa))
-    taus.append(-1.0 / math.log(back))
-report("decay spectrum init round-trip", err, 1e-9)
-print(f"         -> effective time constants span tau = {min(taus):.2f} .. {max(taus):.1f} steps")
-
-
-# ---------------------------------------------------------------------------
-# 9. state stability: with a in (0,1) and b = (1-a)*v the state is a convex
-#    blend, so |h| <= max|v| for any sequence length (no blow-up).
-# ---------------------------------------------------------------------------
-T, D = 4000, 4
-worst = 0.0
-for _ in range(3):
-    aa = [random.uniform(0.0, 1.0) for _ in range(T * D)]
-    vv = [random.gauss(0, 1) for _ in range(T * D)]
-    bb = [(1 - aa[i]) * vv[i] for i in range(T * D)]
-    h = scan_sequential(aa, bb, T, D)
-    worst = max(worst, max(abs(x) for x in h) / max(abs(x) for x in vv))
-report("convex-blend state stays bounded (T=4000)", max(0.0, worst - 1.0), 1e-9)
-
-print()
-if fails:
-    print("FAILED:", ", ".join(fails))
-    raise SystemExit(1)
-print("all derivations verified")
+if __name__ == "__main__":
+    main()

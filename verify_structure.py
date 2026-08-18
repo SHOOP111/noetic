@@ -4,7 +4,8 @@
 Substitutes for the compiler's cheapest checks:
 
   1. delimiter balance per file (comment / string / char-literal aware)
-  2. `mod x;` declarations resolve to x.rs, and every Rust file is declared
+  2. `pub mod x;` declarations in the crate root resolve to x.rs, and every
+     Rust file is declared
   3. `use crate::m::{a, b}` symbols exist as pub items in module m
   4. every `g.method(…)` call on a Graph exists in autograd.rs
   5. format-string placeholder count matches argument count for
@@ -20,6 +21,9 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = HERE if os.path.isfile(os.path.join(HERE, "Cargo.toml")) else os.path.dirname(HERE)
 STANDARD_SRC = os.path.join(REPO, "src")
 SRC = STANDARD_SRC if os.path.isfile(os.path.join(STANDARD_SRC, "main.rs")) else REPO
+# Sources live at the repo root; the crate root that declares the modules is
+# lib.rs (main.rs is a three-line shim over the library).
+ROOT_FILE = "lib.rs"
 files = sorted(f for f in os.listdir(SRC) if f.endswith(".rs"))
 problems = []
 
@@ -81,8 +85,8 @@ def strip_code(text):
     return "".join(out)
 
 
-if "main.rs" not in files:
-    print(f"main.rs not found under {SRC}")
+if ROOT_FILE not in files:
+    print(f"{ROOT_FILE} not found under {SRC}")
     sys.exit(1)
 
 code = {}
@@ -117,16 +121,16 @@ for f in files:
         )
 
 # ---- 2. mod declarations --------------------------------------------------
-main_raw, main_code = code["main.rs"]
-mods = re.findall(r"^\s*mod\s+([a-z_0-9]+)\s*;", main_code, re.M)
+root_raw, root_code = code[ROOT_FILE]
+mods = re.findall(r"^\s*(?:pub\s+)?mod\s+([a-z_0-9]+)\s*;", root_code, re.M)
 for m in mods:
     if m + ".rs" not in files:
-        problems.append(f"main.rs: mod {m}; has no {m}.rs")
+        problems.append(f"{ROOT_FILE}: mod {m}; has no {m}.rs")
 for f in files:
-    if f == "main.rs":
+    if f in (ROOT_FILE, "main.rs"):
         continue
     if f[:-3] not in mods:
-        problems.append(f"{f} is never declared with `mod {f[:-3]};` in main.rs")
+        problems.append(f"{f} is never declared with `mod {f[:-3]};` in {ROOT_FILE}")
 
 # ---- 3. pub item inventory + use checking --------------------------------
 pub_items = {}
@@ -166,10 +170,31 @@ for f in files:
 
 # ---- 4. Graph method calls ------------------------------------------------
 graph_methods = set(re.findall(r"pub\s+fn\s+([a-z_0-9]+)", code["autograd.rs"][1]))
-graph_fields = {
-    "val", "grad", "shape", "params", "threads", "no_grad", "scan_parallel",
-    "aux", "ids",
-}
+
+
+def struct_fields(source, name):
+    """Field names of `struct name { ... }`, read from the source rather than
+    restated here, so renaming a field cannot leave this checker stale."""
+    match = re.search(r"(?:pub\s+)?struct\s+" + name + r"\s*\{", source)
+    if not match:
+        return set()
+    depth = 0
+    end = len(source)
+    for index in range(match.end() - 1, len(source)):
+        if source[index] == "{":
+            depth += 1
+        elif source[index] == "}":
+            depth -= 1
+            if depth == 0:
+                end = index
+                break
+    body = source[match.end() : end]
+    return set(re.findall(r"^\s*(?:pub\s+)?([a-z_0-9]+)\s*:", body, re.M))
+
+
+graph_fields = struct_fields(code["autograd.rs"][1], "Graph")
+if not graph_fields:
+    problems.append("autograd.rs: could not find the Graph struct to read its fields")
 skip_calls = {
     "clone", "len", "iter", "push", "to_vec", "as_str", "sort_by", "is_empty",
     "cmp", "unwrap_or",
